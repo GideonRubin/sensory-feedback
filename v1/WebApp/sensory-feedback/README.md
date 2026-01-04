@@ -10,7 +10,7 @@
 
 1. Navigate to the project directory:
    ```bash
-   cd v1/WebApp/sensory-feedback/sensory-feedback
+   cd v1/WebApp/sensory-feedback
    ```
 
 2. Install dependencies:
