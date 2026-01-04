@@ -1,19 +1,75 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import './App.css'
+import { bleService } from './BleService'
 
 function App() {
-  const [count, setCount] = useState(0)
+  const [isConnected, setIsConnected] = useState(false)
+  const [sensorValue, setSensorValue] = useState<string>('No data')
+  const [ledState, setLedState] = useState(false)
+
+  useEffect(() => {
+    const handleSensorUpdate = (value: string) => {
+      setSensorValue(value)
+    }
+
+    bleService.subscribeToSensor(handleSensorUpdate)
+
+    return () => {
+      bleService.unsubscribeFromSensor(handleSensorUpdate)
+    }
+  }, [])
+
+  const handleConnect = async () => {
+    try {
+      await bleService.connect()
+      setIsConnected(true)
+    } catch (error) {
+      console.error('Failed to connect:', error)
+    }
+  }
+
+  const handleDisconnect = () => {
+    bleService.disconnect()
+    setIsConnected(false)
+    setSensorValue('No data')
+  }
+
+  const toggleLed = async () => {
+    try {
+      const newState = !ledState
+      await bleService.setLed(newState)
+      setLedState(newState)
+    } catch (error) {
+      console.error('Failed to toggle LED:', error)
+    }
+  }
 
   return (
     <>
       <h1>Sensory Feedback App</h1>
       <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
-        </p>
+        {!isConnected ? (
+          <button onClick={handleConnect}>
+            Connect to Device
+          </button>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+            <button onClick={handleDisconnect}>
+              Disconnect
+            </button>
+            
+            <div>
+              <h2>Sensor Value</h2>
+              <p style={{ fontSize: '2em', fontWeight: 'bold' }}>{sensorValue}</p>
+            </div>
+
+            <div>
+              <button onClick={toggleLed}>
+                Turn LED {ledState ? 'OFF' : 'ON'}
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </>
   )
