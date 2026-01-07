@@ -1,77 +1,24 @@
-import { useState, useEffect } from 'react'
+import { BrowserRouter as Router, Routes, Route } from 'react-router-dom'
+import { Navbar } from '@/components/Navbar'
+import { Home } from '@/pages/Home'
+import { Sensors } from '@/pages/Sensors'
+import { Record } from '@/pages/Record'
+import { View } from '@/pages/View'
 import './App.css'
-import { bleService } from './BleService'
 
 function App() {
-  const [isConnected, setIsConnected] = useState(false)
-  const [sensorValue, setSensorValue] = useState<string>('No data')
-  const [ledState, setLedState] = useState(false)
-
-  useEffect(() => {
-    const handleSensorUpdate = (value: string) => {
-      setSensorValue(value)
-    }
-
-    bleService.subscribeToSensor(handleSensorUpdate)
-
-    return () => {
-      bleService.unsubscribeFromSensor(handleSensorUpdate)
-    }
-  }, [])
-
-  const handleConnect = async () => {
-    try {
-      await bleService.connect()
-      setIsConnected(true)
-    } catch (error) {
-      console.error('Failed to connect:', error)
-    }
-  }
-
-  const handleDisconnect = () => {
-    bleService.disconnect()
-    setIsConnected(false)
-    setSensorValue('No data')
-  }
-
-  const toggleLed = async () => {
-    try {
-      const newState = !ledState
-      await bleService.setLed(newState)
-      setLedState(newState)
-    } catch (error) {
-      console.error('Failed to toggle LED:', error)
-    }
-  }
-
   return (
-    <>
-      <h1>Sensory Feedback App</h1>
-      <div className="card">
-        {!isConnected ? (
-          <button onClick={handleConnect}>
-            Connect to Device
-          </button>
-        ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-            <button onClick={handleDisconnect}>
-              Disconnect
-            </button>
-            
-            <div>
-              <h2>Sensor Value</h2>
-              <p style={{ fontSize: '2em', fontWeight: 'bold' }}>{sensorValue}</p>
-            </div>
-
-            <div>
-              <button onClick={toggleLed}>
-                Turn LED {ledState ? 'OFF' : 'ON'}
-              </button>
-            </div>
-          </div>
-        )}
+    <Router>
+      <Navbar />
+      <div className="container mx-auto p-4 pb-24">
+        <Routes>
+          <Route path="/" element={<Home />} />
+          <Route path="/sensors" element={<Sensors />} />
+          <Route path="/record" element={<Record />} />
+          <Route path="/view" element={<View />} />
+        </Routes>
       </div>
-    </>
+    </Router>
   )
 }
 
