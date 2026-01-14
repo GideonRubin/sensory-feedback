@@ -84,6 +84,11 @@ export const EspApi = {
     console.log('getVolume');
     return 0.0;
   },
+  getBatteryHealth: async (): Promise<number> => {
+     // TODO: Implement communication with ESP32
+     // For now return dummy data
+     return 90.0;
+  },
 
   // Second Page
   getSensorsData: (): Sensor[] => {

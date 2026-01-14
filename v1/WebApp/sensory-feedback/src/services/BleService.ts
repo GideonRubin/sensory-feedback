@@ -79,7 +79,7 @@ class BleService implements IBleService {
       console.warn('Command Characteristic not found');
       return;
     }
-    await this.commandCharacteristic.writeValue(data);
+    await this.commandCharacteristic.writeValue(new Uint8Array(data));
   }
   
   async read(): Promise<Uint8Array> {
