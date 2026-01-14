@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import '../App.css'
-import { bleService } from '../BleService'
+import { EspApi } from '../services/api'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 
@@ -14,16 +14,16 @@ export function Home() {
       setSensorValue(value)
     }
 
-    bleService.subscribeToSensor(handleSensorUpdate)
+    EspApi.subscribeToSensor(handleSensorUpdate)
 
     return () => {
-      bleService.unsubscribeFromSensor(handleSensorUpdate)
+      EspApi.unsubscribeFromSensor(handleSensorUpdate)
     }
   }, [])
 
   const handleConnect = async () => {
     try {
-      await bleService.connect()
+      await EspApi.connect()
       setIsConnected(true)
     } catch (error) {
       console.error('Failed to connect:', error)
@@ -31,7 +31,7 @@ export function Home() {
   }
 
   const handleDisconnect = () => {
-    bleService.disconnect()
+    EspApi.disconnect()
     setIsConnected(false)
     setSensorValue('No data')
   }
@@ -39,7 +39,7 @@ export function Home() {
   const toggleLed = async (checked: boolean) => {
     try {
       // The switch passes the new checked state directly
-      await bleService.setLed(checked)
+      await EspApi.switchOn(checked)
       setLedState(checked)
     } catch (error) {
       console.error('Failed to toggle LED:', error)

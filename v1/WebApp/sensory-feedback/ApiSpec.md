@@ -1,5 +1,10 @@
 # API Spec
 
+## Classes
+Sensors:Sensor[]
+Sensor: {id: int,SensorData[]}
+SensorData: {time:Date, amplitude: float}
+
 ## Communication between ESP32 and WebApp
 ### First Page
 - switchOn(bool): void
@@ -8,14 +13,13 @@
 - getVolume(): float
 
 ### Second Page
-Sensor: {id: int,[SensorData]}
-SensorData: {time:Date, amplitude: float}
 
-- getSensorsData(): [Sensor]
-- getSensorsThreshold(): [float]
-- setSensorsThreshold([float]): void
+- getSensorsData(): Sensor[]
+- getSensorsThreshold(): float[]
+- setSensorsThreshold(float[]): void
 - getSensorVolume(void): float
 - setSensorVolume(float): void
 
 ## Communication with Vercel Blob
-- saveSensorData([SensorData])
+- saveSensorData(Sensors): void
+- getSensorsData():Sensors
