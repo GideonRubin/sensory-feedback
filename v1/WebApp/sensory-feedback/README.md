@@ -45,3 +45,30 @@ To preview the production build locally:
 ```bash
 npm run preview
 ```
+
+## Architecture
+
+![Architecture](./architecture.jpg)
+
+### Overview
+The system architecture ties together the Web Application, the ESP32 Hardware, and Cloud Storage.
+
+### Components & Communication
+
+**1. Web Application (PWA)**
+- Acts as the central **Client**.
+- Communicates with the hardware via the **Browser Bluetooth API**.
+- Communicates with the cloud via **HTTP**.
+
+**2. ESP32 (Hardware)**
+- Acts as a **BLE Server**.
+- Collects raw **Sensor Data**.
+- **BLE Communication Loop**:
+  - **Reads (from App perspective)**: Sensor data, Battery health.
+  - **Writes (from App perspective)**: Volume settings, Sensor thresholds, "Ping" test commands.
+
+**3. Vercel Cloud (Blob Storage)**
+- Used for persistent storage of session data.
+- **Writes**: Saves sensor recordings (JSON).
+- **Reads**: Retrieves past sensor recordings (JSON).
+
