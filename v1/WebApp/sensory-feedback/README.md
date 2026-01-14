@@ -28,6 +28,15 @@ npm run dev
 
 Open your browser and navigate to the URL shown in the terminal (usually `http://localhost:5173`).
 
+### Running with Mock Data (Stubs)
+
+To run the application with simulated sensor data (useful for development without the physical device):
+
+```bash
+npm test
+```
+This command runs the development server with `VITE_USE_STUBS=true` enabled.
+
 ### Building for Production
 
 To build the application for production:

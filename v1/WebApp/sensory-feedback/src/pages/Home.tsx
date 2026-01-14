@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react'
 import { EspApi } from '../services/api'
+import { useConnection } from '@/context/ConnectionContext'
 import { Switch } from '@/components/ui/switch'
 import { Slider } from '@/components/ui/slider'
-import { Power, Volume2, Speaker, XCircle, CheckCircle2, Battery, BatteryCharging, BatteryWarning, BatteryMedium, BatteryLow, BatteryFull } from 'lucide-react'
+import { Power, Volume2, Speaker, XCircle, CheckCircle2, BatteryWarning, BatteryMedium, BatteryLow, BatteryFull } from 'lucide-react'
 
 interface Notification {
   message: string;
@@ -10,19 +11,14 @@ interface Notification {
 }
 
 export function Home() {
-  const [isConnected, setIsConnected] = useState(false)
+  const { isConnected, connect, disconnect } = useConnection()
   const [ledState, setLedState] = useState(false)
   const [volume, setVolume] = useState([50]) // Default volume 50
   const [notification, setNotification] = useState<Notification | null>(null)
   const [batteryLevel, setBatteryLevel] = useState<number | null>(null)
 
   useEffect(() => {
-    // Check initial connection status if possible, or assume disconnected
-    setIsConnected(EspApi.isConnected());
-  }, [])
-
-  useEffect(() => {
-    let interval: NodeJS.Timeout;
+    let interval: ReturnType<typeof setInterval>;
     
     if (isConnected) {
       // Initial fetch
@@ -60,16 +56,14 @@ export function Home() {
   const handleConnectionToggle = async (checked: boolean) => {
     if (checked) {
       try {
-        await EspApi.connect()
-        setIsConnected(true)
+        await connect()
         showNotification('Connected successfully', 'success')
       } catch (error) {
         console.error('Failed to connect:', error)
         showNotification('Failed to connect', 'error')
       }
     } else {
-      EspApi.disconnect()
-      setIsConnected(false)
+      disconnect()
       setLedState(false)
       showNotification('Disconnected', 'success')
     }

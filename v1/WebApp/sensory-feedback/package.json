@@ -8,6 +8,7 @@
     "dev -stubs": "VITE_USE_STUBS=true vite",
     "start": "vite",
     "start -stubs": "VITE_USE_STUBS=true vite",
+    "test": "VITE_USE_STUBS=true vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"
