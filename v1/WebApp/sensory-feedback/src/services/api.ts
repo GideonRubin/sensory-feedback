@@ -48,8 +48,18 @@ export const EspApi = {
     return bleService.write(encoder.encode(command));
   },
   read: async (endpoint: string): Promise<string> => {
-     // Note: This matches the previous behavior where endpoint was ignored for reading 
-     // because there is only one characteristic being read.
+     // 1. Send the endpoint name to the device to request data
+     const encoder = new TextEncoder();
+     // Using "GET:ENDPOINT" convention or just "ENDPOINT" depending on preference. 
+     // Given "arduino should get string endpoint", sending just the endpoint might be ambiguous if it looks like a write.
+     // But write uses "ENDPOINT:DATA". Read uses "GET:ENDPOINT" seems safer.
+     const command = `GET:${endpoint}`;
+     await bleService.write(encoder.encode(command));
+     
+     // 2. Wait for the device to update the characteristic value
+     await new Promise(resolve => setTimeout(resolve, 200));
+
+     // 3. Read the response
      const value = await bleService.read();
      const decoder = new TextDecoder('utf-8');
      return decoder.decode(value);
