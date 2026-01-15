@@ -23,21 +23,57 @@ export const BleEndpoints = {
 
 // Helper class for simulation state
 class SensorSimulator {
-  private lastValues: number[];
+  private tick: number = 0;
+  private readonly updateSpeed: number = 0.15; // Speed of the walking cycle
 
-  constructor(count: number) {
-    this.lastValues = new Array(count).fill(0);
+  constructor(_count: number) {
+    // 
   }
 
   getNextValues(): number[] {
-    this.lastValues = this.lastValues.map(last => {
-      const change = (Math.random() - 0.5) * 20;
-      let newValue = Math.max(0, Math.min(100, last + change));
-      // Occasional spike
-      if (Math.random() > 0.95) newValue = Math.min(100, newValue + 30);
-      return newValue;
-    });
-    return this.lastValues;
+    this.tick += this.updateSpeed;
+
+    // Simulate Walking Gait
+    // Cycle: 0 to 2PI
+    
+    // Right Foot (0: RF, 2: RB) - Phase 0
+    // Left Foot  (1: LF, 3: LB) - Phase PI
+    
+    // Within a foot: Heel (Back) strikes first, then Toe (Front)
+    // Front is slightly delayed relative to Back
+    
+    const rightPhase = this.tick;
+    const leftPhase = this.tick + Math.PI;
+    
+    // Function to calculate pressure based on phase
+    // returns 0-100
+    const calcPressure = (phase: number, offset: number) => {
+      // Use sine wave, normalize to 0-1, clip negative values (foot in air)
+      // Raise to power to make peak narrower (sharper impact)
+      const val = Math.sin(phase + offset);
+      return val > 0 ? Math.pow(val, 2) * 100 : 0;
+    };
+
+    // Offsets
+    // Back sensor peaks earlier -> 0 offset
+    // Front sensor peaks later -> 0.5 offset (roughly 1/6 of cycle? PI/6 is approx 0.5)
+    
+    const rb = calcPressure(rightPhase, 0);       // Right Back
+    const rf = calcPressure(rightPhase, -0.6);    // Right Front (delayed)
+    
+    const lb = calcPressure(leftPhase, 0);        // Left Back
+    const lf = calcPressure(leftPhase, -0.6);     // Left Front (delayed)
+
+    // Add some random noise
+    const noise = () => (Math.random() - 0.5) * 5;
+
+    // Map to id: 0=RF, 1=LF, 2=RB, 3=LB
+    return [
+      Math.max(0, Math.min(100, rf + noise())),
+      Math.max(0, Math.min(100, lf + noise())),
+      Math.max(0, Math.min(100, rb + noise())),
+      Math.max(0, Math.min(100, lb + noise())),
+    ];
   }
 }
 
