@@ -1,6 +1,6 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState } from 'react'
 import { Slider } from '@/components/ui/slider'
-import { ChevronDown, ChevronUp, Settings2 } from 'lucide-react'
+import { ChevronDown, ChevronUp } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 interface SensorCardProps {
