@@ -173,9 +173,9 @@ export function Home() {
           <Switch 
             checked={isConnected}
             onCheckedChange={handleConnectionToggle}
-            className="scale-125 data-[state=checked]:bg-slate-900 border-2 border-transparent data-[state=unchecked]:border-slate-200 data-[state=unchecked]:bg-slate-100"
+            className="scale-125 data-[state=checked]:bg-slate-900 border-2 border-transparent data-[state=unchecked]:border-slate-300 data-[state=unchecked]:bg-slate-300"
           />
-          <span className={`text-[10px] font-bold tracking-widest text-slate-300 uppercase transition-opacity duration-300 ${isConnected ? 'opacity-0' : 'opacity-100'}`}>
+          <span className={`text-[10px] font-bold tracking-widest text-slate-500 uppercase transition-opacity duration-300 ${isConnected ? 'opacity-0' : 'opacity-100'}`}>
               Tap to Connect
           </span>
       </div>
