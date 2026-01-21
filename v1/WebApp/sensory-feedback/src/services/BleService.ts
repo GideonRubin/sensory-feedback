@@ -105,6 +105,7 @@ class BleService implements IBleService {
     if (value) {
       const decoder = new TextDecoder('utf-8');
       const stringValue = decoder.decode(value);
+      console.log('Received sensor data:', stringValue);
       this.sensorCallbacks.forEach(cb => cb(stringValue));
     }
   }

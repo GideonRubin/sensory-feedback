@@ -78,13 +78,29 @@ class SensorSimulator {
 }
 
 const simulator = new SensorSimulator(4);
+let latestSensorData: Sensors = [];
 
 /**
  * Communication between ESP32 and WebApp
  */
 export const EspApi = {
   connect: async (): Promise<void> => {
-    return bleService.connect();
+    await bleService.connect();
+    bleService.subscribeToSensor((jsonString) => {
+        try {
+            const parsed = JSON.parse(jsonString);
+            latestSensorData = parsed.map((item: any) => ({
+                id: item.id,
+                data: item.data.map((d: any) => ({
+                    time: new Date(),
+                    // Normalize 12-bit ADC (0-4095) to 0-100 range
+                    amplitude: Math.min(100, (Number(d.amplitude) / 4095) * 100)
+                }))
+            }));
+        } catch (e) {
+            console.error("Error parsing sensor data", e);
+        }
+    });
   },
   disconnect: (): void => {
     bleService.disconnect();
@@ -159,9 +175,7 @@ export const EspApi = {
         data: [{ time: new Date(), amplitude: val }]
       }));
     }
-    // TODO: Implement communication with ESP32
-    // console.log('getSensorsData (ESP) - No Stubs');
-    return [];
+    return latestSensorData;
   },
   getSensorsThreshold: (): number[] => {
     // TODO: Implement communication with ESP32

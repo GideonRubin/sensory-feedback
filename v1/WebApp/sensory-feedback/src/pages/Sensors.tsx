@@ -14,7 +14,7 @@ const SENSORS_CONFIG = [
   { id: 3, label: "Left Back", color: "#2563eb" },   // Blue-600
 ]
 
-const FPS = 10;
+const FPS = 30;
 
 export function Sensors() {
   const { isConnected } = useConnection()
@@ -45,7 +45,8 @@ export function Sensors() {
   
   const frameCounterRef = useRef(0);
 
-  const currentSensors = history.map(h => h[Math.floor(h.length / 2)] || 0);
+  // Use the latest value for real-time feedback, not the middle of the history buffer
+  const currentSensors = history.map(h => h[h.length - 1] || 0);
 
   useEffect(() => {
     document.body.style.overflow = 'hidden';
