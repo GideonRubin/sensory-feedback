@@ -4,7 +4,6 @@ import { useConnection } from '@/context/ConnectionContext'
 import { EspApi } from '../services/api'
 import { SensorCard } from '@/components/SensorCard'
 import { WalkingModel } from '@/components/WalkingModel'
-import { Play, Pause, Circle } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 // Define the 4 sensors
@@ -29,8 +28,13 @@ export function Sensors() {
 
   const [thresholds, setThresholds] = useState<number[]>([50, 50, 50, 50])
   const [volumes, setVolumes] = useState<number[]>([80, 80, 80, 80])
-  const [isPaused, setIsPaused] = useState(false)
   
+  // Recording State
+  const [isRecording, setIsRecording] = useState(false)
+  const [recordingStartTime, setRecordingStartTime] = useState<number | null>(null)
+  const [recordingDuration, setRecordingDuration] = useState(0)
+  const recordedDataRef = useRef<{ time: number; values: number[] }[]>([])
+
   const [history, setHistory] = useState<number[][]>(
     SENSORS_CONFIG.map(() =>  new Array(60).fill(0))
   )
@@ -38,20 +42,36 @@ export function Sensors() {
   const historyRef = useRef<number[][]>(
     SENSORS_CONFIG.map(() =>  new Array(60).fill(0))
   );
+  
+  const frameCounterRef = useRef(0);
 
   const currentSensors = history.map(h => h[Math.floor(h.length / 2)] || 0);
 
   useEffect(() => {
     document.body.style.overflow = 'hidden';
-    return () => {
-      document.body.style.overflow = '';
+    let recordingInterval: NodeJS.Timeout;
+
+    if (isRecording && recordingStartTime) {
+      recordingInterval = setInterval(() => {
+        setRecordingDuration(Math.floor((Date.now() - recordingStartTime) / 1000));
+      }, 1000);
+    } else {
+      setRecordingDuration(0);
     }
-  }, []);
+
+    return () => {
+        document.body.style.overflow = '';
+        clearInterval(recordingInterval);
+    };
+  }, [isRecording, recordingStartTime]);
 
   useEffect(() => {
     const interval = setInterval(() => {
         const sensorsData = EspApi.getSensorsData();
         
+        // Prepare current frame data
+        const currentFrameValues: number[] = [];
+
         const nextHistory = historyRef.current.map((sensorHistory, index) => {
                const apiSensor = sensorsData.find(s => s.id === index);
                
@@ -59,20 +79,62 @@ export function Sensors() {
                if (apiSensor && apiSensor.data.length > 0) {
                    newValue = apiSensor.data[apiSensor.data.length - 1].amplitude;
                }
+               
+               currentFrameValues.push(Math.round(newValue * 10) / 10);
 
                return [...sensorHistory.slice(1), newValue];
         });
         
         historyRef.current = nextHistory;
 
-        if (!isPaused) {
-           setHistory(nextHistory);
+        // Recording Logic: 5 FPS (every 2nd frame since FPS=10)
+        if (isRecording && recordingStartTime != null) {
+            frameCounterRef.current = (frameCounterRef.current + 1) % 2;
+            
+            if (frameCounterRef.current === 0) {
+                 recordedDataRef.current.push({
+                    time: Date.now() - recordingStartTime,
+                    values: currentFrameValues
+                });
+            }
+        } else {
+             frameCounterRef.current = 0; // Reset counter when not recording
         }
+
+        setHistory(nextHistory);
 
     }, 1000 / FPS); 
 
     return () => clearInterval(interval);
-  }, [isPaused]); 
+  }, [isRecording, recordingStartTime]);
+
+  const handleRecordToggle = () => {
+      if (isRecording) {
+          // STOP RECORDING
+          setIsRecording(false);
+          setRecordingStartTime(null);
+          
+          // Generate file
+          const dataStr = JSON.stringify(recordedDataRef.current, null, 2);
+          const blob = new Blob([dataStr], { type: "text/plain" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `sensor-recording-${new Date().toISOString()}.json`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          
+          // Clear buffer
+          recordedDataRef.current = [];
+      } else {
+          // START RECORDING
+          setIsRecording(true);
+          setRecordingStartTime(Date.now());
+          recordedDataRef.current = [];
+      }
+  };
 
   const handleThresholdChange = (index: number, val: number) => {
       const newThresholds = [...thresholds];
@@ -95,18 +157,17 @@ export function Sensors() {
       <div className="absolute top-0 left-0 w-full h-[50vh] bg-gradient-to-b from-slate-200/50 to-transparent -z-10" />
       
       {/* Header Area with Walking Model */}
-      <div className="relative pt-2 pb-1 px-4 flex-none max-w-sm mx-auto w-full">
-          <div className="bg-white rounded-2xl shadow-lg shadow-slate-200/40 p-2 border border-white/50 relative overflow-hidden h-[30vh] min-h-[160px] flex items-center justify-center">
-             <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-orange-400 via-purple-500 to-blue-500 opacity-70" />
+      <div className="relative pt-0 pb-1 px-4 flex-none max-w-sm mx-auto w-full">
+          <div className="relative overflow-hidden h-[25vh] min-h-[160px] flex items-center justify-center">
              <WalkingModel sensors={currentSensors} />
-             <div className="absolute bottom-1 left-0 w-full text-center">
-                <span className="text-[9px] uppercase tracking-[0.2em] text-slate-400 font-semibold">Real-time Feedback</span>
+             <div className="absolute bottom-2 left-0 w-full text-center">
+                <span className="text-[9px] uppercase tracking-[0.2em] text-slate-400 font-semibold bg-white/50 px-2 py-0.5 rounded-full backdrop-blur-sm border border-white/40">Real-time Feedback</span>
              </div>
           </div>
       </div>
 
       {/* Main Content Area - Scrollable */}
-      <div className="flex-1 w-full max-w-md mx-auto px-3 overflow-y-auto no-scrollbar pb-24 pt-1">
+      <div className="flex-1 w-full max-w-md mx-auto px-3 overflow-y-auto no-scrollbar pb-40 pt-1">
         <div className="flex flex-col gap-2">
             {/* Group Right */}
             <div className="space-y-1.5">
@@ -149,39 +210,43 @@ export function Sensors() {
       </div>
 
        {/* Control Deck */}
-       <div className="fixed bottom-18 left-1/2 -translate-x-1/2 z-40 animate-in slide-in-from-bottom-10 fade-in duration-500">
-          <div className="flex items-center gap-3 p-2">
+       <div className="fixed bottom-32 left-1/2 -translate-x-1/2 z-40 animate-in slide-in-from-bottom-10 fade-in duration-500">
+          <div className={cn(
+              "flex items-center transition-all duration-300 rounded-full border border-white/20 bg-white/10 backdrop-blur-sm",
+              isRecording ? "gap-4 pl-4 pr-1" : "gap-0 p-1"
+          )}>
               
-              {/* Record Button */}
+              {/* Timer Display */}
+              <div className={cn(
+                  "font-mono text-sm font-medium transition-all duration-300 w-12 text-center",
+                  isRecording ? "text-red-500 opacity-100" : "text-slate-400 opacity-0 w-0 overflow-hidden"
+              )}>
+                  {Math.floor(recordingDuration / 60)}:{String(recordingDuration % 60).padStart(2, '0')}
+              </div>
+
+              {/* Record Button - Minimalist */}
               <button 
-                  className="group flex flex-col items-center gap-1"
-                  aria-label="Record"
+                  onClick={handleRecordToggle}
+                  className={cn(
+                      "group relative flex items-center justify-center transition-all duration-300",
+                      isRecording ? "scale-100" : "hover:scale-105"
+                  )}
+                  aria-label={isRecording ? "Stop Recording" : "Start Recording"}
               >
-                  <div className="w-10 h-10 rounded-full bg-white/80 backdrop-blur-md border border-white/60 shadow-lg text-slate-400 flex items-center justify-center transition-all duration-300 group-hover:bg-white group-hover:scale-105 group-active:scale-95">
-                      <div className="w-3 h-3 rounded-full bg-red-500 shadow-sm group-hover:shadow-[0_0_8px_rgba(239,68,68,0.6)] transition-all" />
+                  <div className={cn(
+                      "w-12 h-12 rounded-full flex items-center justify-center transition-all duration-300 border",
+                      isRecording
+                        ? "bg-red-50 border-red-200" 
+                        : "bg-white border-slate-100 text-slate-400"
+                  )}>
+                      <div className={cn(
+                          "transition-all duration-300",
+                          isRecording 
+                            ? "w-4 h-4 rounded-[4px] bg-red-500" // Square (Stop)
+                            : "w-3 h-3 rounded-full bg-red-500"   // Circle (Record)
+                      )} />
                   </div>
               </button>
-
-              {/* Play/Pause Button */}
-              <button 
-                  onClick={() => setIsPaused(!isPaused)}
-                  className={cn(
-                      "w-14 h-14 rounded-[1.2rem] flex items-center justify-center transition-all duration-300 shadow-xl backdrop-blur-md border active:scale-95",
-                      !isPaused 
-                      ? "bg-slate-900 border-slate-800 text-white shadow-slate-900/25 hover:bg-slate-800" 
-                      : "bg-white/95 border-white text-slate-800 shadow-slate-200/50"
-                  )}
-              >
-                  {!isPaused 
-                    ? <Pause className="w-5 h-5 fill-current" /> 
-                    : <Play className="w-5 h-5 fill-current ml-1" />
-                  }
-              </button>
-
-              {/* Spacer button for balance (could be screenshot, markings, or settings in future) - making it invisible to keep center balance if user wants exact center, 
-                  OR better: just 2 buttons. But centering 2 buttons makes the center of the screen empty.
-                  Let's put them close together in the center.
-              */}
           </div>
       </div>
     </div>
