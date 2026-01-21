@@ -49,7 +49,7 @@ export function Sensors() {
 
   useEffect(() => {
     document.body.style.overflow = 'hidden';
-    let recordingInterval: NodeJS.Timeout;
+    let recordingInterval: ReturnType<typeof setInterval>;
 
     if (isRecording && recordingStartTime) {
       recordingInterval = setInterval(() => {

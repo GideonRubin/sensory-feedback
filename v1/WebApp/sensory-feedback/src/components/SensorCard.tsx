@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Slider } from '@/components/ui/slider'
-import { ChevronDown, ChevronUp, Settings2 } from 'lucide-react'
+import { ChevronUp, Settings2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 interface SensorCardProps {
@@ -57,8 +57,6 @@ export function SensorCard({
   }
 
   const maskId = `mask-${label.replace(/\s/g, '')}`
-  const lastValue = data[data.length - 1] || 0;
-  const isActive = lastValue > threshold;
 
   return (
     <div className={cn(
