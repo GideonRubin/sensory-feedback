@@ -1,7 +1,7 @@
 import { Link, useLocation } from "react-router-dom"
 import { cn } from "@/lib/utils"
 import { useConnection } from "@/context/ConnectionContext"
-import { Home, Activity, Mic, Eye } from "lucide-react"
+import { Home, Activity, Eye } from "lucide-react"
 
 export function Navbar() {
   const location = useLocation()
@@ -10,7 +10,6 @@ export function Navbar() {
   const navItems = [
     { path: "/", label: "Home", icon: Home, disabled: false },
     { path: "/sensors", label: "Sensors", icon: Activity, disabled: !isConnected },
-    { path: "/record", label: "Record", icon: Mic, disabled: !isConnected },
     { path: "/view", label: "View", icon: Eye, disabled: false },
   ]
 

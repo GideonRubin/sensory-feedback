@@ -2,7 +2,6 @@ import { BrowserRouter as Router, Routes, Route } from 'react-router-dom'
 import { Navbar } from '@/components/Navbar'
 import { Home } from '@/pages/Home'
 import { Sensors } from '@/pages/Sensors'
-import { Record } from '@/pages/Record'
 import { View } from '@/pages/View'
 import { ConnectionProvider } from '@/context/ConnectionContext'
 import './App.css'
@@ -16,7 +15,6 @@ function App() {
           <Routes>
             <Route path="/" element={<Home />} />
             <Route path="/sensors" element={<Sensors />} />
-            <Route path="/record" element={<Record />} />
             <Route path="/view" element={<View />} />
           </Routes>
         </div>
