@@ -148,7 +148,7 @@ export function Sensors() {
        const newVolumes = [...volumes];
        newVolumes[index] = val;
        setVolumes(newVolumes);
-       EspApi.setSensorVolume(val); 
+       EspApi.setSensorVolume(index, val); 
   };
 
   return (

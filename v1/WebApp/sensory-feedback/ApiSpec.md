@@ -17,8 +17,8 @@ SensorData: {time:Date, amplitude: float}
 - getSensorsData(): Sensor[]
 - getSensorsThreshold(): float[]
 - setSensorsThreshold(float[]): void
-- getSensorVolume(void): float
-- setSensorVolume(float): void
+- getSensorVolume(int): float
+- setSensorVolume(int, float): void
 
 ## Communication with Vercel Blob
 - saveSensorData(Sensors): void

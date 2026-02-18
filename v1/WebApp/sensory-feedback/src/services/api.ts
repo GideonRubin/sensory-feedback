@@ -19,6 +19,7 @@ export const BleEndpoints = {
   PING: 'PING',
   VOLUME_TOTAL: 'VOLUME_TOTAL',
   SENSOR_THRESHOLD: 'SENSOR_THRESHOLD',
+  SENSOR_VOLUME: 'SENSOR_VOLUME',
 } as const;
 
 // Helper class for simulation state
@@ -186,14 +187,14 @@ export const EspApi = {
     // TODO: Implement communication with ESP32
     console.log('setSensorsThreshold', thresholds);
   },
-  getSensorVolume: (): number => {
+  getSensorVolume: (id: number): number => {
     // TODO: Implement communication with ESP32
-    console.log('getSensorVolume');
+    console.log('getSensorVolume', id);
     return 0.0;
   },
-  setSensorVolume: (volume: number): void => {
-    // TODO: Implement communication with ESP32
-    console.log('setSensorVolume', volume);
+  setSensorVolume: (id: number, volume: number): void => {
+    const data = `${id},${volume}`;
+    EspApi.write(BleEndpoints.SENSOR_VOLUME, data);
   },
 };
 

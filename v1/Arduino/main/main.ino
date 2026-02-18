@@ -13,6 +13,9 @@
 // ---------- Audio & Pin Configuration ----------
 // CHANGE: Removed 'const', made volatile so it can change dynamically
 volatile float VOL = 1.0f; 
+// Store max volume per sensor (0.0 to 100.0 from app -> normalized 0.0 to 1.0 or similar)
+// User wants 100 as max, 0 as min. We'll store as float 0.0-1.0 for calculation.
+volatile float sensorMaxVol[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
 #define I2S_BCLK_PIN  GPIO_NUM_27
 #define I2S_WS_PIN    GPIO_NUM_14
@@ -145,17 +148,55 @@ class MyServerCallbacks: public BLEServerCallbacks {
 };
 
 class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* pLedCharacteristic) {
-    String value = pLedCharacteristic->getValue();
-    if (value.length() > 0) {
-      Serial.print("Characteristic event, written: ");
-      Serial.println(static_cast<int>(value[0])); // Print the integer value
+  void onWrite(BLECharacteristic* pCharacteristic) {
+    String value = pCharacteristic->getValue();
+    if (value.length() == 0) return;
 
-      int receivedValue = static_cast<int>(value[0]);
-      if (receivedValue == 1) {
+    // Check for single-byte legacy LED command (1 byte payload)
+    if (value.length() == 1) {
+      uint8_t val = (uint8_t)value[0];
+      if (val == 1) {
         digitalWrite(ledPin, HIGH);
       } else {
         digitalWrite(ledPin, LOW);
+      }
+      return;
+    }
+
+    // Parse string command: "CMD:DATA"
+    String cmdStr = value;
+    int separatorIndex = cmdStr.indexOf(':');
+    
+    // If no separator, it might be a raw command or just garbage, ignore or handle differently
+    if (separatorIndex == -1) return;
+
+    String command = cmdStr.substring(0, separatorIndex);
+    String data = cmdStr.substring(separatorIndex + 1);
+
+    if (command == "SENSOR_VOLUME") {
+      // Data format: "ID,VOLUME"
+      int commaIndex = data.indexOf(',');
+      if (commaIndex != -1) {
+        // substring(startIndex, endIndex) vs substring(startIndex)
+        // Arduino String::substring(from, to) or (from).
+        // It takes an index. Let's use substring carefully.
+        // String::substring(unsigned int left, unsigned int right)
+        // If right is not provided, end of string.
+        String idStr = data.substring(0, commaIndex);
+        String volStr = data.substring(commaIndex + 1);
+        
+        int id = idStr.toInt();
+        float volume = volStr.toFloat();
+        
+        if (id >= 0 && id < 4) {
+          // Store max volume (0-100 -> 0.0-1.0)
+          // Ensure we don't exceed array bounds or valid float range
+          if (volume < 0) volume = 0;
+          if (volume > 100) volume = 100;
+          
+          sensorMaxVol[id] = volume / 100.0f;
+          Serial.printf("Set Sensor %d Max Vol: %f\n", id, sensorMaxVol[id]);
+        }
       }
     }
   }
@@ -267,8 +308,14 @@ void loop() {
     if (normalizedForce > 1) normalizedForce = 1;
 
     // Linearly interpolate volume
-    // Min Volume = 0.5, Max Volume = 2.0
-    VOL = 0.5f + (normalizedForce * 1.5f); 
+    // Use the specific sensor's max volume ceiling as a scaling factor
+    float scalingFactor = sensorMaxVol[maxIdx]; // 0.0 to 1.0
+    
+    // Base Calculation: Map force (0.0-1.0) to a desired audio gain range (e.g., 0.5 to 2.5)
+    float baseVolume = 0.5f + (normalizedForce * 2.0f);
+    
+    // Apply user scaling factor
+    VOL = baseVolume * scalingFactor;
 
     if (maxIdx != currentWinner) {
       currentWinner = maxIdx;

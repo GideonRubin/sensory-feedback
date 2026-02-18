@@ -13,7 +13,7 @@ interface Notification {
 export function Home() {
   const { isConnected, connect, disconnect } = useConnection()
   const [ledState, setLedState] = useState(false)
-  const [volume, setVolume] = useState([50]) // Default volume 50
+  const [volume, setVolume] = useState([100]) // Default volume 100
   const [notification, setNotification] = useState<Notification | null>(null)
   const [batteryLevel, setBatteryLevel] = useState<number | null>(null)
 
@@ -90,7 +90,10 @@ export function Home() {
     const newVol = value[0];
     setVolume(value);
     if (!isConnected) return;
-    EspApi.setVolumeTotal(newVol);
+    // Set volume for all 4 sensors
+    for(let i=0; i<4; i++) {
+      EspApi.setSensorVolume(i, newVol);
+    }
   }
 
   const getBatteryIcon = (level: number) => {
