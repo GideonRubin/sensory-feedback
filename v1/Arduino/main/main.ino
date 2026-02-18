@@ -16,6 +16,7 @@ volatile float VOL = 1.0f;
 // Store max volume per sensor (0.0 to 100.0 from app -> normalized 0.0 to 1.0 or similar)
 // User wants 100 as max, 0 as min. We'll store as float 0.0-1.0 for calculation.
 volatile float sensorMaxVol[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+volatile bool systemOn = true; // Default to TRUE (On) as per user request (switched off only via button)
 
 #define I2S_BCLK_PIN  GPIO_NUM_27
 #define I2S_WS_PIN    GPIO_NUM_14
@@ -68,6 +69,12 @@ void audioTask(void *parameter) {
   i2s_channel_enable(tx_handle);
 
   while (true) {
+    // Check global systemOn flag (extern or just check targetTrack which is 0 when off)
+    // If we want to completely stop playing even silence when off, we could check systemOn.
+    // However, I2S usually needs a steady stream to avoid pops when resuming.
+    // Writing 0s (silence) is the standard way to "not play". 
+    // If we stop writing, the I2S DMA buffer might run dry or emit noise.
+    
     // Check if we need to switch tracks
     if (targetTrack != currentTrackID) {
       if (wavFile) wavFile.close();
@@ -157,8 +164,10 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
       uint8_t val = (uint8_t)value[0];
       if (val == 1) {
         digitalWrite(ledPin, HIGH);
+        systemOn = true;
       } else {
         digitalWrite(ledPin, LOW);
+        systemOn = false;
       }
       return;
     }
@@ -278,6 +287,14 @@ void setup() {
 }
 
 void loop() {
+  if (!systemOn) {
+    // If system is OFF, silence audio and do not process audio logic
+    if (VOL != 0.0f) VOL = 0.0f;
+    if (targetTrack != 0) targetTrack = 0;
+    
+    // We still need to handle BLE connections, so we fall through to BLE Logic
+  }
+
   // ---- Read Sensors ----
   int sensorValues[numSensors];
   int maxVal = 0;
@@ -294,51 +311,43 @@ void loop() {
 
   // ---- Audio Logic (New Logic) ----
   static int currentWinner = -1;
-  static uint32_t lastDisconnectTime = 0;
+  
+  // Only run audio logic if system is ON
+  if (systemOn) {
+    // Simple threshold logic from new sketch
+    if (maxVal > 300) { 
+        // Force calculation
+        float normalizedForce = (float)(maxVal - 300) / (4095 - 300); // 0.0 to 1.0
+        if (normalizedForce < 0) normalizedForce = 0;
+        if (normalizedForce > 1) normalizedForce = 1;
 
-  // Simple threshold logic from new sketch
-  if (maxVal > 300) { 
-    // CHANGE: Map force (maxVal) to Volume
-    // Sensor range: 300 (threshold) to 4095 (max)
-    // Volume range: 0.8 (slightly quieter than now) to 2.5 (much louder/boosted)
-    // Note: Going above 1.0 might cause "clipping" (distortion) if the original WAV is already loud.
-    
-    float normalizedForce = (float)(maxVal - 300) / (4095 - 300); // 0.0 to 1.0
-    if (normalizedForce < 0) normalizedForce = 0;
-    if (normalizedForce > 1) normalizedForce = 1;
-
-    // Linearly interpolate volume
-    // Use the specific sensor's max volume ceiling as a scaling factor
-    float scalingFactor = sensorMaxVol[maxIdx]; // 0.0 to 1.0
-    
-    // Base Calculation: Map force (0.0-1.0) to a desired audio gain range (e.g., 0.5 to 2.5)
-    float baseVolume = 0.5f + (normalizedForce * 2.0f);
-    
-    // Apply user scaling factor
-    VOL = baseVolume * scalingFactor;
-
-    if (maxIdx != currentWinner) {
-      currentWinner = maxIdx;
-      targetTrack = currentWinner + 1; // Tracks 1..4
-      // Pan left for 0, 2; Right for 1, 3
-      targetPan = (currentWinner == 0 || currentWinner == 2) ? 0.0f : 1.0f;
-      // Optional logging
-      // Serial.printf("New Winner: %d, Track: %d\n", currentWinner, targetTrack);
+        float scalingFactor = sensorMaxVol[maxIdx]; 
+        float baseVolume = 0.5f + (normalizedForce * 2.0f);
+        
+        VOL = baseVolume * scalingFactor;
+        
+        if (maxIdx != currentWinner) {
+          currentWinner = maxIdx;
+          targetTrack = currentWinner + 1; // Tracks 1..4
+          targetPan = (currentWinner == 0 || currentWinner == 2) ? 0.0f : 1.0f;
+        }
+    } else {
+        // Signal below threshold -> silence
+        VOL = 0.0f;
     }
   } else { 
-    targetTrack = 0; // Stop
-    currentWinner = -1;
-    VOL = 0.0f; // Silence
+      // System is OFF
+      targetTrack = 0; // Stop
+      currentWinner = -1;
+      VOL = 0.0f; // Silence
   }
 
-  // ---- BLE Logic (Existing Logic) ----
+  // ---- BLE Logic ----
   if (deviceConnected) {
-    // Construct JSON string for notification
+    // Construct JSON string
     String json = "[";
     for (int i = 0; i < numSensors; i++) {
       if (i > 0) json += ",";
-      
-      // Formatting: { "id": 1, "data": [ { "time": "...", "amplitude": 75.5 } ] }
       json += "{\"id\":";
       json += i;
       json += ",\"data\":[{\"time\":\"";

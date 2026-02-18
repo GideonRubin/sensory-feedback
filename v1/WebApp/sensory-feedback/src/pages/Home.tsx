@@ -3,7 +3,7 @@ import { EspApi } from '../services/api'
 import { useConnection } from '@/context/ConnectionContext'
 import { Switch } from '@/components/ui/switch'
 import { Slider } from '@/components/ui/slider'
-import { Power, Volume2, Speaker, XCircle, CheckCircle2, BatteryWarning, BatteryMedium, BatteryLow, BatteryFull } from 'lucide-react'
+import { Power, Volume2, Speaker, XCircle, CheckCircle2 } from 'lucide-react'
 
 interface Notification {
   message: string;
@@ -12,35 +12,9 @@ interface Notification {
 
 export function Home() {
   const { isConnected, connect, disconnect } = useConnection()
-  const [ledState, setLedState] = useState(false)
+  const [ledState, setLedState] = useState(true) // Default to true (ON)
   const [volume, setVolume] = useState([100]) // Default volume 100
   const [notification, setNotification] = useState<Notification | null>(null)
-  const [batteryLevel, setBatteryLevel] = useState<number | null>(null)
-
-  useEffect(() => {
-    let interval: ReturnType<typeof setInterval>;
-    
-    if (isConnected) {
-      // Initial fetch
-      EspApi.getBatteryHealth().then(setBatteryLevel);
-      
-      // Poll every 10 seconds
-      interval = setInterval(async () => {
-        try {
-          const level = await EspApi.getBatteryHealth();
-          setBatteryLevel(level);
-        } catch (error) {
-          console.error("Failed to fetch battery:", error);
-        }
-      }, 10000);
-    } else {
-      setBatteryLevel(null);
-    }
-
-    return () => {
-      if (interval) clearInterval(interval);
-    }
-  }, [isConnected]);
 
   useEffect(() => {
     if (notification) {
@@ -58,13 +32,16 @@ export function Home() {
       try {
         await connect()
         showNotification('Connected successfully', 'success')
+        // Ensure device is ON by default upon connection
+        await EspApi.switchOn(true)
+        setLedState(true)
       } catch (error) {
         console.error('Failed to connect:', error)
         showNotification('Failed to connect', 'error')
       }
     } else {
       disconnect()
-      setLedState(false)
+      setLedState(true) // Reset UI state to default ON
       showNotification('Disconnected', 'success')
     }
   }
@@ -122,24 +99,9 @@ export function Home() {
               ? 'bg-white/90 border-emerald-100 text-emerald-700 shadow-emerald-100/50' 
               : 'bg-white/90 border-red-100 text-red-700 shadow-red-100/50'
           }`}>
-            {notification.type === 'success' ? <CheckCircle2 className="w-4 h-4"/> : <XCircle className="w-4 h-4"/>}
-            <span className="font-medium text-sm">{notification.message}</span>
-          </div>
-        )}
-      </div>
-
-      {/* Main Content Group: Centered Vertically */}
-      <div className="flex-1 w-full max-w-sm flex flex-col items-center justify-center gap-10 py-8">
-        {isConnected && (
-            <>
-              {/* Buttons Row */}
-              <div className="flex items-center justify-center gap-8 animate-in fade-in zoom-in-95 duration-700 ease-out">
-                {/* Power Button */}
-                <button 
-                  onClick={handlePowerClick}
-                  className={`w-28 h-28 rounded-full flex items-center justify-center transition-all duration-300 active:scale-95 border-[6px] ${
-                    ledState 
-                      ? 'bg-slate-800 border-slate-800 text-white shadow-2xl shadow-slate-300' 
+  return (
+    <div className="flex flex-col items-center justify-between min-h-[calc(100vh-8rem)] relative bg-background font-roboto">
+                            ? 'bg-slate-800 border-slate-800 text-white shadow-2xl shadow-slate-300' 
                       : 'bg-transparent border-slate-100 text-slate-300 hover:border-slate-200 hover:text-slate-400'
                   }`}
                 >

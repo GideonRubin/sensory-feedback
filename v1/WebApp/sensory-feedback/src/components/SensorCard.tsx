@@ -69,7 +69,7 @@ export function SensorCard({
       {/* Main Header / Visual Area */}
       <div 
         className="relative h-14 w-full cursor-pointer group"
-        onClick={() => setIsExpanded(!isExpanded)}
+        onClick={() => { /* setIsExpanded(!isExpanded) */ }}
       >
         {/* Background Gradient Mesh (Optional nice touch) */}
         <div 
@@ -127,7 +127,7 @@ export function SensorCard({
                  </div>
             </div>
 
-            <div className="flex items-center gap-2">
+            {/* <div className="flex items-center gap-2">
                 <div 
                     className={cn(
                         "w-7 h-7 rounded-full flex items-center justify-center transition-colors duration-200",
@@ -136,17 +136,16 @@ export function SensorCard({
                 >
                     {isExpanded ? <ChevronUp className="w-4 h-4" /> : <Settings2 className="w-4 h-4" />}
                 </div>
-            </div>
+            </div> */}
         </div>
       </div>
 
       {/* Expanded Settings Area */}
-      <div className={cn(
+      {/* <div className={cn(
           "bg-slate-50/50 transition-all duration-300 ease-in-out border-t border-slate-100",
           isExpanded ? "max-h-40 opacity-100" : "max-h-0 opacity-0 overflow-hidden"
       )}>
         <div className="p-3 space-y-4">
-            {/* Threshold Control */}
             <div className="space-y-2">
                 <div className="flex justify-between items-center">
                     <span className="text-[10px] font-medium text-slate-500 uppercase tracking-wider">Activation Threshold</span>
@@ -160,11 +159,9 @@ export function SensorCard({
                     step={1} 
                     onValueChange={(v) => onThresholdChange(v[0])}
                     className="cursor-grab active:cursor-grabbing"
-                    // Note: Slider component usually applies --primary color, might need custom styling passed if wanted specific color
                 />
             </div>
             
-            {/* Volume Control */}
             <div className="space-y-2">
                 <div className="flex justify-between items-center">
                     <span className="text-[10px] font-medium text-slate-500 uppercase tracking-wider">Feedback Intensity</span>
@@ -180,7 +177,7 @@ export function SensorCard({
                 />
             </div>
         </div>
-      </div>
+      </div> */}
     </div>
   )
 }
