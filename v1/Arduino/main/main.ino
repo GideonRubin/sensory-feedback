@@ -9,34 +9,37 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <Arduino.h>
-#include "DFRobotDFPlayerMini.h"
+#include <SPI.h>
+#include <SD.h>
+#include "driver/i2s_std.h"
 
-// ---------- DFPlayer ----------
-HardwareSerial mp3Serial(2);
-DFRobotDFPlayerMini player;
+// ---------- Audio & Pin Configuration ----------
+const float VOL = 1.0f;
 
-// ---------- State ----------
-int currentTrack = 0;     // 0 = stopped, 1..4 playing
-int winnerIndex  = -1;
-
-static const int PRESS_THRESHOLD = 200;
-static const int SWITCH_MARGIN   = 80;
-static const uint32_t RELEASE_MS = 150;
-
-static const int FIXED_VOLUME = 30;
-
-uint32_t lastAboveThresholdMs = 0;
-
-BLEServer* pServer = NULL;
-BLECharacteristic* pSensorCharacteristic = NULL;
-BLECharacteristic* pLedCharacteristic = NULL;
-bool deviceConnected = false;
-bool oldDeviceConnected = false;
+#define I2S_BCLK_PIN  GPIO_NUM_27
+#define I2S_WS_PIN    GPIO_NUM_14
+#define I2S_DOUT_PIN  GPIO_NUM_22
+#define SD_CS_PIN     5
+#define SPI_SCK       18
+#define SPI_MISO      19
+#define SPI_MOSI      23
 
 // Define sensor pins (ADC pins on ESP32)
 const int sensorPins[] = {34, 35, 32, 33}; 
 const int numSensors = 4;
 const int ledPin = 2; // Use the appropriate GPIO pin for your setup
+
+// Audio Task Globals
+volatile int targetTrack = 0;   
+volatile float targetPan = 0.5f;
+i2s_chan_handle_t tx_handle = NULL;
+
+// ---------- BLE State ----------
+BLEServer* pServer = NULL;
+BLECharacteristic* pSensorCharacteristic = NULL;
+BLECharacteristic* pLedCharacteristic = NULL;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
 
 // See the following for generating UUIDs:
 // https://www.uuidgenerator.net/
@@ -44,6 +47,95 @@ const int ledPin = 2; // Use the appropriate GPIO pin for your setup
 #define SENSOR_CHARACTERISTIC_UUID "19b10001-e8f2-537e-4f6c-d104768a1214"
 #define LED_CHARACTERISTIC_UUID "19b10002-e8f2-537e-4f6c-d104768a1214"
 
+// ---------- Audio Task ----------
+void audioTask(void *parameter) {
+  File wavFile;
+  // Increase buffer size slightly for stability if needed, or keep 512
+  const size_t bufSize = 1024; 
+  int16_t *buffer = (int16_t *)heap_caps_malloc(bufSize, MALLOC_CAP_DMA);
+  
+  if (buffer == NULL) {
+    Serial.println("Failed to allocate audio buffer");
+    vTaskDelete(NULL);
+    return;
+  }
+
+  int currentTrackID = 0;
+  bool firstBuffer = false;
+  
+  // Enable the channel
+  i2s_channel_enable(tx_handle);
+
+  while (true) {
+    // Check if we need to switch tracks
+    if (targetTrack != currentTrackID) {
+      if (wavFile) wavFile.close();
+      currentTrackID = targetTrack;
+      
+      if (currentTrackID > 0) {
+        char path[16];
+        // Format: /0001.wav, /0002.wav, etc. matches common SD structure
+        snprintf(path, sizeof(path), "/%04d.wav", currentTrackID);
+        
+        if (SD.exists(path)) {
+            wavFile = SD.open(path);
+            if (wavFile) {
+              // Skip WAV header (typical 44 bytes)
+              wavFile.seek(44);
+              firstBuffer = true; 
+            } else {
+              currentTrackID = 0;
+            }
+        } else {
+            // File doesn't exist
+            currentTrackID = 0;
+        }
+      }
+    }
+
+    if (currentTrackID > 0 && wavFile && wavFile.available()) {
+      float gainL = (1.0f - targetPan) * VOL;
+      float gainR = targetPan * VOL;
+
+      size_t bytesRead = wavFile.read((uint8_t*)buffer, bufSize);
+      size_t samples = bytesRead / 2; // 16-bit samples
+
+      // Apply volume/panning
+      for (int i = 0; i < samples; i+=2) {
+         // Simple fade-in for first buffer to avoid clicks could go here
+         float smoothFactor = 1.0f;
+         if (firstBuffer) {
+           smoothFactor = (float)i / samples; 
+         }
+         
+         // Stereo processing: even indices are Left (usually), odd are Right
+         // Note: buffer contains interleaved 16-bit samples [L, R, L, R...]
+         if (i+1 < samples) {
+             buffer[i]   = (int16_t)((float)buffer[i]   * gainL * smoothFactor);
+             buffer[i+1] = (int16_t)((float)buffer[i+1] * gainR * smoothFactor);
+         }
+      }
+      
+      firstBuffer = false; 
+      size_t bytesWritten = 0;
+      i2s_channel_write(tx_handle, buffer, bytesRead, &bytesWritten, portMAX_DELAY);
+      
+      // Loop the track if we reach the end but target hasn't changed
+      if (bytesRead < bufSize) {
+          wavFile.seek(44); 
+      }
+    } else {
+      // Silence when no track is playing
+      memset(buffer, 0, bufSize);
+      size_t bytesWritten = 0;
+      i2s_channel_write(tx_handle, buffer, bufSize, &bytesWritten, portMAX_DELAY);
+      // Small delay to yield to other tasks
+      vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+  }
+}
+
+// ---------- BLE Callbacks ----------
 class MyServerCallbacks: public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) {
     deviceConnected = true;
@@ -76,21 +168,48 @@ void setup() {
   pinMode(ledPin, OUTPUT);
   
   // Initialize sensor pins
+  analogReadResolution(12); // Ensure we use 12-bit resolution matching new sketch
   for(int i = 0; i < numSensors; i++) {
     pinMode(sensorPins[i], INPUT);
   }
 
-  // Create the BLE Device
-  BLEDevice::init("ESP32");
+  // ---------- SD & I2S Setup ----------
+  // Initialize SPI for SD Card
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SD_CS_PIN);
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println("SD Init Failed!");
+    // We continue mostly so BLE can still work, but audio won't
+  } else {
+    Serial.println("SD Card Ready");
+  }
 
-  // Create the BLE Server
+  // Initialize I2S
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  i2s_new_channel(&chan_cfg, &tx_handle, NULL);
+  i2s_std_config_t std_cfg = {
+      .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(22050), // Matches typical WAV sample rate
+      .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+      .gpio_cfg = {
+        .mclk = I2S_GPIO_UNUSED, 
+        .bclk = I2S_BCLK_PIN, 
+        .ws = I2S_WS_PIN, 
+        .dout = I2S_DOUT_PIN, 
+        .din = I2S_GPIO_UNUSED
+      }
+  };
+  i2s_channel_init_std_mode(tx_handle, &std_cfg);
+  
+  // Start Audio Task on Core 0 (leaving Core 1 for Arduino Loop/BLE)
+  xTaskCreatePinnedToCore(audioTask, "AudioTask", 4096, NULL, 10, NULL, 0);
+  Serial.println("Audio Task Started.");
+
+  // ---------- BLE Init ----------
+  BLEDevice::init("ESP32");
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 
-  // Create the BLE Service
   BLEService *pService = pServer->createService(SERVICE_UUID);
 
-  // Create a BLE Characteristic
   pSensorCharacteristic = pService->createCharacteristic(
                       SENSOR_CHARACTERISTIC_UUID,
                       BLECharacteristic::PROPERTY_READ   |
@@ -99,112 +218,72 @@ void setup() {
                       BLECharacteristic::PROPERTY_INDICATE
                     );
 
-  // Create the ON button Characteristic
   pLedCharacteristic = pService->createCharacteristic(
                       LED_CHARACTERISTIC_UUID,
                       BLECharacteristic::PROPERTY_WRITE
                     );
 
-  // Register the callback for the ON button characteristic
   pLedCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
 
-  // https://www.bluetooth.com/specifications/gatt/viewer?attributeXmlFile=org.bluetooth.descriptor.gatt.client_characteristic_configuration.xml
-  // Create a BLE Descriptor
   pSensorCharacteristic->addDescriptor(new BLE2902());
   pLedCharacteristic->addDescriptor(new BLE2902());
 
-  // Start the service
   pService->start();
 
-  // Start advertising
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->setScanResponse(false);
-  pAdvertising->setMinPreferred(0x0);  // set value to 0x00 to not advertise this parameter
+  pAdvertising->setMinPreferred(0x0);  
   BLEDevice::startAdvertising();
   Serial.println("Waiting a client connection to notify...");
-
-  // ---------- DFPlayer Init ----------
-  mp3Serial.begin(9600, SERIAL_8N1, 16, 17);
-  delay(300);
-
-  if (!player.begin(mp3Serial)) {
-    Serial.println("DFPlayer init failed!");
-    // We don't want to halt BLE if Audio fails, so we won't loop forever here
-  } else {
-    player.outputDevice(DFPLAYER_DEVICE_SD);
-    player.EQ(DFPLAYER_EQ_NORMAL);
-    player.volume(FIXED_VOLUME);
-    Serial.println("DFPlayer Ready. Files: 0001.mp3 .. 0004.mp3");
-  }
 }
 
 void loop() {
   // ---- Read Sensors ----
   int sensorValues[numSensors];
-  int maxValue = 0;
-  int maxIndex = -1;
+  int maxVal = 0;
+  int maxIdx = -1;
   unsigned long timestamp = millis();
 
   for (int i = 0; i < numSensors; i++) {
     sensorValues[i] = analogRead(sensorPins[i]);
-    if (sensorValues[i] > maxValue) {
-      maxValue = sensorValues[i];
-      maxIndex = i;
+    if (sensorValues[i] > maxVal) {
+      maxVal = sensorValues[i];
+      maxIdx = i;
     }
   }
 
-  // ---- Audio Logic (Always Active) ----
-  // press tracking with release delay
-  if (maxValue >= PRESS_THRESHOLD) {
-    lastAboveThresholdMs = timestamp;
-  }
+  // ---- Audio Logic (New Logic) ----
+  static int currentWinner = -1;
+  static uint32_t lastDisconnectTime = 0;
 
-  bool pressed = (timestamp - lastAboveThresholdMs) <= RELEASE_MS;
-
-  if (!pressed) {
-    if (currentTrack != 0) {
-      player.stop();
-      currentTrack = 0;
-      winnerIndex = -1;
-      // Serial.println("STOP");
+  // Simple threshold logic from new sketch
+  if (maxVal > 300) { 
+    if (maxIdx != currentWinner) {
+      currentWinner = maxIdx;
+      targetTrack = currentWinner + 1; // Tracks 1..4
+      // Pan left for 0, 2; Right for 1, 3
+      targetPan = (currentWinner == 0 || currentWinner == 2) ? 0.0f : 1.0f;
+      // Optional logging
+      // Serial.printf("New Winner: %d, Track: %d\n", currentWinner, targetTrack);
     }
   } else {
-    // Determine winner
-    if (winnerIndex == -1) {
-      winnerIndex = maxIndex;
-    } else {
-      int prevVal = sensorValues[winnerIndex];
-      // Switch if another sensor is significantly stronger
-      if (maxIndex != winnerIndex && maxValue >= prevVal + SWITCH_MARGIN) {
-        winnerIndex = maxIndex;
-      }
-    }
-
-    int desiredTrack = winnerIndex + 1; // 1..4
-
-    // Play ONLY on change
-    if (desiredTrack != currentTrack) {
-      currentTrack = desiredTrack;
-      player.play(currentTrack);
-      Serial.print("Play track ");
-      Serial.println(currentTrack);
-    }
+    targetTrack = 0; // Stop
+    currentWinner = -1;
   }
 
-  // ---- BLE Logic ----
-  // notify changed value
+  // ---- BLE Logic (Existing Logic) ----
   if (deviceConnected) {
+    // Construct JSON string for notification
     String json = "[";
-
     for (int i = 0; i < numSensors; i++) {
       if (i > 0) json += ",";
       
-      // Construct Sensor Object: { "id": 1, "data": [ { "time": "...", "amplitude": 75.5 } ] }
+      // Formatting: { "id": 1, "data": [ { "time": "...", "amplitude": 75.5 } ] }
       json += "{\"id\":";
       json += i;
       json += ",\"data\":[{\"time\":\"";
-      json += timestamp; // Sending millis as a simplified timestamp
+      json += timestamp;
       json += "\",\"amplitude\":";
       json += sensorValues[i];
       json += "}]}";
@@ -213,26 +292,21 @@ void loop() {
 
     pSensorCharacteristic->setValue(json.c_str());
     pSensorCharacteristic->notify();
-    
-    // Serial debugging (optional, can be commented out for speed)
-    // Serial.print("Notified: ");
-    // Serial.println(json);
   }
 
-  // disconnecting
+  // BLE Maintenance
   if (!deviceConnected && oldDeviceConnected) {
     Serial.println("Device disconnected.");
-    delay(500); // give the bluetooth stack the chance to get things ready
-    pServer->startAdvertising(); // restart advertising
+    delay(500); 
+    pServer->startAdvertising(); 
     Serial.println("Start advertising");
     oldDeviceConnected = deviceConnected;
   }
-  // connecting
+  
   if (deviceConnected && !oldDeviceConnected) {
-    // do stuff here on connecting
     oldDeviceConnected = deviceConnected;
     Serial.println("Device Connected");
   }
 
-  delay(25); // Faster loop for audio responsiveness
+  delay(25); // Loop delay
 }
