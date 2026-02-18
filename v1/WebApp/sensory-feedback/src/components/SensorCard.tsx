@@ -1,6 +1,6 @@
 import { useState } from 'react'
-import { Slider } from '@/components/ui/slider'
-import { ChevronUp, Settings2 } from 'lucide-react'
+// import { Slider } from '@/components/ui/slider'
+// import { ChevronUp, Settings2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 interface SensorCardProps {
@@ -17,12 +17,12 @@ export function SensorCard({
   label, 
   data, 
   threshold, 
-  volume, 
-  onThresholdChange, 
-  onVolumeChange,
+  // volume, 
+  // onThresholdChange, 
+  // onVolumeChange,
   color = "#f97316" // Orange-500
 }: SensorCardProps) {
-  const [isExpanded, setIsExpanded] = useState(false)
+  const [isExpanded] = useState(false)
   
   const renderChart = () => {
     if (data.length === 0) return ""

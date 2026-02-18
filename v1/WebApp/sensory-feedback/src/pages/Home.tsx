@@ -3,7 +3,7 @@ import { EspApi } from '../services/api'
 import { useConnection } from '@/context/ConnectionContext'
 import { Switch } from '@/components/ui/switch'
 import { Slider } from '@/components/ui/slider'
-import { Power, Volume2, Speaker, XCircle, CheckCircle2, BatteryWarning, BatteryMedium, BatteryLow, BatteryFull } from 'lucide-react'
+import { Power, Volume2, XCircle, CheckCircle2 } from 'lucide-react'
 
 interface Notification {
   message: string;
@@ -15,9 +15,9 @@ export function Home() {
   const [ledState, setLedState] = useState(true)
   const [volume, setVolume] = useState([100]) // Default volume 100
   const [notification, setNotification] = useState<Notification | null>(null)
-  const [batteryLevel, setBatteryLevel] = useState<number | null>(null)
+  // const [batteryLevel, setBatteryLevel] = useState<number | null>(null)
 
-  useEffect(() => {
+  /* useEffect(() => {
     let interval: ReturnType<typeof setInterval>;
     
     if (isConnected) {
@@ -40,7 +40,7 @@ export function Home() {
     return () => {
       if (interval) clearInterval(interval);
     }
-  }, [isConnected]);
+  }, [isConnected]); */
 
   useEffect(() => {
     if (notification) {
@@ -81,10 +81,10 @@ export function Home() {
     }
   }
 
-  const handlePingClick = () => {
-    if (!isConnected) return;
-    EspApi.ping();
-  }
+  // const handlePingClick = () => {
+  //   if (!isConnected) return;
+  //   EspApi.ping();
+  // }
 
   const handleVolumeChange = (value: number[]) => {
     const newVol = value[0];
@@ -96,12 +96,12 @@ export function Home() {
     }
   }
 
-  const getBatteryIcon = (level: number) => {
+  /* const getBatteryIcon = (level: number) => {
     if (level > 90) return <BatteryFull className="w-5 h-5" />;
     if (level > 50) return <BatteryMedium className="w-5 h-5" />;
     if (level > 20) return <BatteryLow className="w-5 h-5" />;
     return <BatteryWarning className="w-5 h-5 text-red-500" />;
-  }
+  } */
 
   return (
     <div className="flex flex-col items-center justify-between min-h-[calc(100vh-8rem)] relative bg-background font-roboto">
