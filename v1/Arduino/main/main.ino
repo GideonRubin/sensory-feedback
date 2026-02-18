@@ -1,9 +1,6 @@
 /*
-  Rui Santos & Sara Santos - Random Nerd Tutorials
-  Complete project details at https://RandomNerdTutorials.com/esp32-web-bluetooth/
-  Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files.
-  The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-*/
+  TOM Project
+  */
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -14,7 +11,8 @@
 #include "driver/i2s_std.h"
 
 // ---------- Audio & Pin Configuration ----------
-const float VOL = 1.0f;
+// CHANGE: Removed 'const', made volatile so it can change dynamically
+volatile float VOL = 1.0f; 
 
 #define I2S_BCLK_PIN  GPIO_NUM_27
 #define I2S_WS_PIN    GPIO_NUM_14
@@ -259,6 +257,19 @@ void loop() {
 
   // Simple threshold logic from new sketch
   if (maxVal > 300) { 
+    // CHANGE: Map force (maxVal) to Volume
+    // Sensor range: 300 (threshold) to 4095 (max)
+    // Volume range: 0.8 (slightly quieter than now) to 2.5 (much louder/boosted)
+    // Note: Going above 1.0 might cause "clipping" (distortion) if the original WAV is already loud.
+    
+    float normalizedForce = (float)(maxVal - 300) / (4095 - 300); // 0.0 to 1.0
+    if (normalizedForce < 0) normalizedForce = 0;
+    if (normalizedForce > 1) normalizedForce = 1;
+
+    // Linearly interpolate volume
+    // Min Volume = 0.5, Max Volume = 2.0
+    VOL = 0.5f + (normalizedForce * 1.5f); 
+
     if (maxIdx != currentWinner) {
       currentWinner = maxIdx;
       targetTrack = currentWinner + 1; // Tracks 1..4
@@ -267,9 +278,10 @@ void loop() {
       // Optional logging
       // Serial.printf("New Winner: %d, Track: %d\n", currentWinner, targetTrack);
     }
-  } else {
+  } else { 
     targetTrack = 0; // Stop
     currentWinner = -1;
+    VOL = 0.0f; // Silence
   }
 
   // ---- BLE Logic (Existing Logic) ----
