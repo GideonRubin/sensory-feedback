@@ -4,7 +4,8 @@ import { useConnection } from '@/context/ConnectionContext'
 import { EspApi } from '../services/api'
 import { SensorCard } from '@/components/SensorCard'
 import { WalkingModel } from '@/components/WalkingModel'
-import { cn } from '@/lib/utils'
+import { useRecording } from '@/hooks/useRecording'
+import { RecordingControls } from '@/components/RecordingControls'
 
 // Define the 4 sensors
 const SENSORS_CONFIG = [
@@ -29,11 +30,13 @@ export function Sensors() {
   const [thresholds, setThresholds] = useState<number[]>([50, 50, 50, 50])
   const [volumes, setVolumes] = useState<number[]>([80, 80, 80, 80])
   
-  // Recording State
-  const [isRecording, setIsRecording] = useState(false)
-  const [recordingStartTime, setRecordingStartTime] = useState<number | null>(null)
-  const [recordingDuration, setRecordingDuration] = useState(0)
-  const recordedDataRef = useRef<{ time: number; values: number[] }[]>([])
+  // Recording Hook
+  const { 
+    isRecording, 
+    recordingDuration, 
+    toggleRecording, 
+    captureFrame 
+  } = useRecording();
 
   const [history, setHistory] = useState<number[][]>(
     SENSORS_CONFIG.map(() =>  new Array(60).fill(0))
@@ -43,28 +46,16 @@ export function Sensors() {
     SENSORS_CONFIG.map(() =>  new Array(60).fill(0))
   );
   
-  const frameCounterRef = useRef(0);
-
   // Use the latest value for real-time feedback, not the middle of the history buffer
   const currentSensors = history.map(h => h[h.length - 1] || 0);
 
+  // Lock body scroll
   useEffect(() => {
     document.body.style.overflow = 'hidden';
-    let recordingInterval: ReturnType<typeof setInterval>;
-
-    if (isRecording && recordingStartTime) {
-      recordingInterval = setInterval(() => {
-        setRecordingDuration(Math.floor((Date.now() - recordingStartTime) / 1000));
-      }, 1000);
-    } else {
-      setRecordingDuration(0);
-    }
-
     return () => {
         document.body.style.overflow = '';
-        clearInterval(recordingInterval);
     };
-  }, [isRecording, recordingStartTime]);
+  }, []);
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -88,54 +79,16 @@ export function Sensors() {
         
         historyRef.current = nextHistory;
 
-        // Recording Logic: 5 FPS (every 2nd frame since FPS=10)
-        if (isRecording && recordingStartTime != null) {
-            frameCounterRef.current = (frameCounterRef.current + 1) % 2;
-            
-            if (frameCounterRef.current === 0) {
-                 recordedDataRef.current.push({
-                    time: Date.now() - recordingStartTime,
-                    values: currentFrameValues
-                });
-            }
-        } else {
-             frameCounterRef.current = 0; // Reset counter when not recording
-        }
+        // Capture data if recording
+        captureFrame(currentFrameValues);
 
         setHistory(nextHistory);
 
     }, 1000 / FPS); 
 
     return () => clearInterval(interval);
-  }, [isRecording, recordingStartTime]);
+  }, [captureFrame]);
 
-  const handleRecordToggle = () => {
-      if (isRecording) {
-          // STOP RECORDING
-          setIsRecording(false);
-          setRecordingStartTime(null);
-          
-          // Generate file
-          const dataStr = JSON.stringify(recordedDataRef.current, null, 2);
-          const blob = new Blob([dataStr], { type: "text/plain" });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = `sensor-recording-${new Date().toISOString()}.json`;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          URL.revokeObjectURL(url);
-          
-          // Clear buffer
-          recordedDataRef.current = [];
-      } else {
-          // START RECORDING
-          setIsRecording(true);
-          setRecordingStartTime(Date.now());
-          recordedDataRef.current = [];
-      }
-  };
 
   const handleThresholdChange = (index: number, val: number) => {
       const newThresholds = [...thresholds];
@@ -211,45 +164,11 @@ export function Sensors() {
       </div>
 
        {/* Control Deck */}
-       <div className="fixed bottom-32 left-1/2 -translate-x-1/2 z-40 animate-in slide-in-from-bottom-10 fade-in duration-500">
-          <div className={cn(
-              "flex items-center transition-all duration-300 rounded-full border border-white/20 bg-white/10 backdrop-blur-sm",
-              isRecording ? "gap-4 pl-4 pr-1" : "gap-0 p-1"
-          )}>
-              
-              {/* Timer Display */}
-              <div className={cn(
-                  "font-mono text-sm font-medium transition-all duration-300 w-12 text-center",
-                  isRecording ? "text-red-500 opacity-100" : "text-slate-400 opacity-0 w-0 overflow-hidden"
-              )}>
-                  {Math.floor(recordingDuration / 60)}:{String(recordingDuration % 60).padStart(2, '0')}
-              </div>
-
-              {/* Record Button - Minimalist */}
-              <button 
-                  onClick={handleRecordToggle}
-                  className={cn(
-                      "group relative flex items-center justify-center transition-all duration-300",
-                      isRecording ? "scale-100" : "hover:scale-105"
-                  )}
-                  aria-label={isRecording ? "Stop Recording" : "Start Recording"}
-              >
-                  <div className={cn(
-                      "w-12 h-12 rounded-full flex items-center justify-center transition-all duration-300 border",
-                      isRecording
-                        ? "bg-red-50 border-red-200" 
-                        : "bg-white border-slate-100 text-slate-400"
-                  )}>
-                      <div className={cn(
-                          "transition-all duration-300",
-                          isRecording 
-                            ? "w-4 h-4 rounded-[4px] bg-red-500" // Square (Stop)
-                            : "w-3 h-3 rounded-full bg-red-500"   // Circle (Record)
-                      )} />
-                  </div>
-              </button>
-          </div>
-      </div>
+       <RecordingControls 
+          isRecording={isRecording}
+          duration={recordingDuration}
+          onToggle={toggleRecording}
+       />
     </div>
   )
 }
