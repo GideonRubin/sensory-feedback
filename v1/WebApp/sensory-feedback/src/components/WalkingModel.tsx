@@ -66,25 +66,26 @@ const Shoe = ({ side, sensors, position }: { side: 'left' | 'right', sensors: nu
   )
 }
 
-export function WalkingModel({ sensors }: WalkingModelProps) {
+
+export function WalkingModel({ sensors, camera = [2, 2, 4], fov = 45, modelPosition = [0, -0.5, 0] }: WalkingModelProps & { camera?: [number, number, number], fov?: number, modelPosition?: [number, number, number] }) {
   return (
-    <div className="h-40 w-full bg-slate-100/50 rounded-xl overflow-hidden shadow-inner border border-slate-200">
-      <Canvas shadows camera={{ position: [3, 2, 3], fov: 35 }}>
+    <div className="w-full h-full">
+      <Canvas shadows camera={{ position: camera, fov: fov }}>
         <ambientLight intensity={0.7} />
         <pointLight position={[10, 10, 10]} intensity={1} castShadow />
         <Environment preset="city" />
         
-        <group position={[0, -0.4, 0]}>
+        <group position={modelPosition}>
             {/* Right Shoe */}
-            <Shoe side="right" sensors={sensors} position={[0.4, 0, 0]} />
+            <Shoe side="right" sensors={sensors} position={[0.5, 0, 0]} />
             
             {/* Left Shoe */}
-            <Shoe side="left" sensors={sensors} position={[-0.4, 0, 0]} />
+            <Shoe side="left" sensors={sensors} position={[-0.5, 0, 0]} />
 
             <ContactShadows position={[0, 0, 0]} opacity={0.4} scale={10} blur={2.5} far={1} />
         </group>
         
-        <OrbitControls enablePan={false} enableZoom={false} minPolarAngle={Math.PI / 4} maxPolarAngle={Math.PI / 2} />
+        <OrbitControls enablePan={true} enableZoom={true} minPolarAngle={Math.PI / 4} maxPolarAngle={Math.PI / 2} />
       </Canvas>
     </div>
   )

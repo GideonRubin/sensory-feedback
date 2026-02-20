@@ -8,7 +8,7 @@ interface RecordingControlsProps {
 
 export function RecordingControls({ isRecording, duration, onToggle }: RecordingControlsProps) {
     return (
-       <div className="fixed bottom-32 left-1/2 -translate-x-1/2 z-40 animate-in slide-in-from-bottom-10 fade-in duration-500">
+       <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-40 animate-in slide-in-from-bottom-10 fade-in duration-500">
           <div className={cn(
               "flex items-center transition-all duration-300 rounded-full border border-white/20 bg-white/10 backdrop-blur-sm",
               isRecording ? "gap-4 pl-4 pr-1" : "gap-0 p-1"

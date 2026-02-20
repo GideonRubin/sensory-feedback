@@ -169,10 +169,21 @@ class BleStubService implements IBleService {
   private startSimulatingData() {
     if (this.intervalId) return;
     this.intervalId = setInterval(() => {
-      // Simulate some changing sensor value
-      const value = (Math.sin(Date.now() / 1000) * 100).toFixed(2);
-      this.sensorCallbacks.forEach(cb => cb(value));
-    }, 1000);
+      // Simulate complex sensor data (4 sensors)
+      const now = Date.now() / 1000;
+      const data = [0, 1, 2, 3].map(id => {
+          // Send raw adc values (0-4095)
+          // Use simple sine waves with different phases
+          const rawValue = Math.max(0, Math.sin(now + id) * 2000 + 1000); 
+          return {
+              id,
+              data: [{ amplitude: Math.floor(rawValue) }]
+          };
+      });
+
+      const jsonString = JSON.stringify(data);
+      this.sensorCallbacks.forEach(cb => cb(jsonString));
+    }, 100); // 10Hz simulator
   }
 
   private stopSimulatingData() {
