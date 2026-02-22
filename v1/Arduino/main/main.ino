@@ -9,6 +9,8 @@
 #include <SPI.h>
 #include <SD.h>
 #include "driver/i2s_std.h"
+#include "esp_bt.h"
+#include "esp_gap_ble_api.h"
 
 // ---------- Audio & Pin Configuration ----------
 volatile float sensorMaxVol[4] = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -347,8 +349,18 @@ void audioTask(void *parameter) {
 
 // ---------- BLE Callbacks ----------
 class MyServerCallbacks: public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) {
+  void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) {
     deviceConnected = true;
+    // Increase supervision timeout for range tolerance (walk around room)
+    // Default ~200ms is too aggressive — BLE drops on 2-3 meter distance.
+    // 4-second timeout lets the radio recover from brief obstructions.
+    esp_ble_conn_update_params_t conn_params = {};
+    memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
+    conn_params.min_int  = 0x10;   // 20ms   (units: 1.25ms)
+    conn_params.max_int  = 0x20;   // 40ms
+    conn_params.latency  = 0;      // no slave latency
+    conn_params.timeout  = 400;    // 4000ms (units: 10ms)
+    esp_ble_gap_update_conn_params(&conn_params);
   };
 
   void onDisconnect(BLEServer* pServer) {
@@ -569,6 +581,12 @@ void setup() {
 
   // ---------- BLE Init ----------
   BLEDevice::init("ESP32");
+
+  // Max TX power (+9 dBm) for better range — default is ~+3 dBm
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, ESP_PWR_LVL_P9);
+
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 

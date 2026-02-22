@@ -52,13 +52,9 @@ export function Home() {
     }
   }, [notification]);
 
-  // Reset audio mode to accordion when BLE disconnects (crash or manual)
-  // Prevents crash loop: ESP32 resets to mode 0, but stale UI state would re-send mode 1
-  useEffect(() => {
-    if (!isConnected) {
-      setAudioMode(0);
-    }
-  }, [isConnected]);
+  // Mode persists across unexpected disconnects (e.g. BLE range loss).
+  // On reconnect, syncStateToDevice() re-sends the current mode.
+  // Only manual disconnect (toggle off) resets to accordion — see handleConnectionToggle.
 
   const showNotification = (message: string, type: 'success' | 'error') => {
     setNotification({ message, type });
