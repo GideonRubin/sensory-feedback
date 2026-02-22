@@ -68,6 +68,11 @@ bool songFileOpen = false;
 volatile bool needOpenSong = false;
 volatile bool needCloseSong = false;
 
+// BLE notification runs on Core 0 (same core as BLE stack) to prevent
+// cross-core mutex deadlock. loop() writes data here, Core 0 task sends it.
+char blePayload[80];
+volatile bool bleNeedsSend = false;
+
 // Mode 1: Per-channel frequency-band filtering with hold+decay
 // Right foot → right speaker, Left foot → left speaker
 // Walking restores filtered frequencies, holds 1.5s, then decays
@@ -224,11 +229,11 @@ void audioTask(void *parameter) {
     // ---- Mode 1: Song + frequency filter ----
     if (currentMode == 1 && songFileOpen) {
       size_t bytesRead = songFile.read((uint8_t*)songBuf, bufSize);
+      taskYIELD();  // yield after blocking SD read to let loop() run
       if (bytesRead < bufSize) {
+        // At song end: pad with silence, rewind for next cycle (avoids 2nd SD read)
+        memset((uint8_t*)songBuf + bytesRead, 0, bufSize - bytesRead);
         songFile.seek(WAV_HEADER_SIZE);
-        if (bufSize - bytesRead > 0) {
-          songFile.read((uint8_t*)songBuf + bytesRead, bufSize - bytesRead);
-        }
       }
 
       float mv = masterVol;
@@ -335,8 +340,8 @@ void audioTask(void *parameter) {
     size_t bytesWritten = 0;
     i2s_channel_write(tx_handle, buffer, bufSize, &bytesWritten, portMAX_DELAY);
 
-    // Yield to let loop() run on same core (sensors + BLE notify)
-    vTaskDelay(1);
+    // Yield to let loop() run on same core
+    vTaskDelay(pdMS_TO_TICKS(2));
   }
 }
 
@@ -488,6 +493,20 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
+// ---------- BLE Notify Task (Core 0) ----------
+// Runs on the same core as BLE stack — eliminates cross-core mutex contention.
+// loop() on Core 1 just writes blePayload + sets flag, this task does the actual notify.
+void bleNotifyTask(void *parameter) {
+  while (true) {
+    if (bleNeedsSend && deviceConnected) {
+      pSensorCharacteristic->setValue(blePayload);
+      pSensorCharacteristic->notify();
+      bleNeedsSend = false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));  // check every 20ms
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   pinMode(ledPin, OUTPUT);
@@ -543,9 +562,13 @@ void setup() {
   i2s_channel_init_std_mode(tx_handle, &std_cfg);
   
   // Audio on Core 1 (same core as Arduino loop) — frees Core 0 for BLE stack
-  // Priority 5 > loop's 1, so audio gets CPU when needed but yields on I2S DMA block
-  xTaskCreatePinnedToCore(audioTask, "AudioTask", 16384, NULL, 5, NULL, 1);
+  // Priority 3 > loop's 1, so audio gets CPU when needed but yields on I2S DMA block
+  xTaskCreatePinnedToCore(audioTask, "AudioTask", 16384, NULL, 3, NULL, 1);
   Serial.println("Audio Task Started.");
+
+  // BLE notify on Core 0 (same core as BLE stack) — prevents cross-core mutex deadlock
+  xTaskCreatePinnedToCore(bleNotifyTask, "BLENotify", 2048, NULL, 2, NULL, 0);
+  Serial.println("BLE Notify Task Started.");
 
   // ---------- BLE Init ----------
   BLEDevice::init("ESP32");
@@ -669,31 +692,35 @@ void loop() {
   }
 
   // ---- BLE Logic ----
-  if (deviceConnected) {
-    // Compact format: ~45 bytes (fits in 3 BLE packets) vs old ~250 bytes (13 packets)
-    // Format: {"t":millis,"s":[val0,val1,val2,val3]}
-    char json[80];
-    snprintf(json, sizeof(json), "{\"t\":%lu,\"s\":[%d,%d,%d,%d]}",
+  // Write sensor data to shared buffer; Core 0 bleNotifyTask does the actual BLE send.
+  // This prevents loop() from holding BLE mutex while audio task preempts it.
+  if (deviceConnected && !bleNeedsSend) {
+    snprintf(blePayload, sizeof(blePayload), "{\"t\":%lu,\"s\":[%d,%d,%d,%d]}",
       timestamp,
       sensorValues[0], sensorValues[1], sensorValues[2], sensorValues[3]);
-
-    pSensorCharacteristic->setValue(json);
-    pSensorCharacteristic->notify();
+    bleNeedsSend = true;  // signal Core 0 task to send
   }
 
   // BLE Maintenance
   if (!deviceConnected && oldDeviceConnected) {
     Serial.println("Device disconnected.");
-    delay(500); 
-    pServer->startAdvertising(); 
+    delay(500);
+    pServer->startAdvertising();
     Serial.println("Start advertising");
     oldDeviceConnected = deviceConnected;
   }
-  
+
   if (deviceConnected && !oldDeviceConnected) {
     oldDeviceConnected = deviceConnected;
     Serial.println("Device Connected");
   }
 
-  delay(50); // Loop delay — 50ms gives BLE radio time to finish transmitting
+  // Heap monitoring (every ~5 seconds)
+  static unsigned long lastHeapLog = 0;
+  if (millis() - lastHeapLog > 5000) {
+    lastHeapLog = millis();
+    Serial.printf("Free heap: %d  Min: %d\n", ESP.getFreeHeap(), ESP.getMinFreeHeap());
+  }
+
+  delay(50);
 }
