@@ -670,17 +670,12 @@ void loop() {
 
   // ---- BLE Logic ----
   if (deviceConnected) {
-    // Fixed-size buffer — zero heap allocation, prevents memory fragmentation
-    char json[320];
-    int pos = 0;
-    pos += snprintf(json + pos, sizeof(json) - pos, "[");
-    for (int i = 0; i < numSensors; i++) {
-      if (i > 0) pos += snprintf(json + pos, sizeof(json) - pos, ",");
-      pos += snprintf(json + pos, sizeof(json) - pos,
-        "{\"id\":%d,\"data\":[{\"time\":\"%lu\",\"amplitude\":%d}]}",
-        i, timestamp, sensorValues[i]);
-    }
-    snprintf(json + pos, sizeof(json) - pos, "]");
+    // Compact format: ~45 bytes (fits in 3 BLE packets) vs old ~250 bytes (13 packets)
+    // Format: {"t":millis,"s":[val0,val1,val2,val3]}
+    char json[80];
+    snprintf(json, sizeof(json), "{\"t\":%lu,\"s\":[%d,%d,%d,%d]}",
+      timestamp,
+      sensorValues[0], sensorValues[1], sensorValues[2], sensorValues[3]);
 
     pSensorCharacteristic->setValue(json);
     pSensorCharacteristic->notify();
@@ -700,5 +695,5 @@ void loop() {
     Serial.println("Device Connected");
   }
 
-  delay(25); // Loop delay
+  delay(50); // Loop delay — 50ms gives BLE radio time to finish transmitting
 }

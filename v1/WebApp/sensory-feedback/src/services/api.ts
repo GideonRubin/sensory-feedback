@@ -101,18 +101,29 @@ export const EspApi = {
     bleService.subscribeToSensor((jsonString) => {
         try {
             const parsed = JSON.parse(jsonString);
-            latestSensorData = parsed.map((item: any) => ({
-                id: item.id,
-                data: item.data.map((d: any) => {
-                    // Normalize 12-bit ADC (0-4095) to 0-100 range
-                    const normalized = Math.min(100, (Number(d.amplitude) / 4095) * 100);
-                    // Store raw normalized value for calibration use
-                    latestRawNormalized[item.id] = normalized;
-                    // Subtract calibration baseline so display shows force relative to rest
-                    const calibrated = Math.max(0, normalized - (calibrationBaselines[item.id] || 0));
-                    return { time: new Date(), amplitude: calibrated };
-                })
-            }));
+            // Compact format: {"t":millis,"s":[val0,val1,val2,val3]}
+            if (parsed.s && Array.isArray(parsed.s)) {
+                latestSensorData = parsed.s.map((amplitude: number, index: number) => {
+                    const normalized = Math.min(100, (amplitude / 4095) * 100);
+                    latestRawNormalized[index] = normalized;
+                    const calibrated = Math.max(0, normalized - (calibrationBaselines[index] || 0));
+                    return {
+                        id: index,
+                        data: [{ time: new Date(), amplitude: calibrated }]
+                    };
+                });
+            } else if (Array.isArray(parsed)) {
+                // Legacy format: [{"id":0,"data":[{"time":"...","amplitude":1234}]},...]
+                latestSensorData = parsed.map((item: any) => ({
+                    id: item.id,
+                    data: item.data.map((d: any) => {
+                        const normalized = Math.min(100, (Number(d.amplitude) / 4095) * 100);
+                        latestRawNormalized[item.id] = normalized;
+                        const calibrated = Math.max(0, normalized - (calibrationBaselines[item.id] || 0));
+                        return { time: new Date(), amplitude: calibrated };
+                    })
+                }));
+            }
         } catch (e) {
             console.error("Error parsing sensor data", e);
         }
