@@ -50,22 +50,22 @@ File songFile;
 bool songFileOpen = false;
 #define WAV_HEADER_SIZE 44
 
-// Mode 1: Shared circular delay buffer for BOTH effects
-// Long enough for the longest delay (250ms = 5512 frames)
-#define DELAY_BUF_FRAMES 5512
-int16_t delayBuffer[DELAY_BUF_FRAMES * 2];  // stereo circular buffer
-int delayWritePos = 0;
+// Mode 1: Frequency-band filtering
+// Split song into BASS and TREBLE using single-pole low-pass at ~800Hz
+// Walking restores the filtered-out frequencies = always positive enrichment
+//
+// Low-pass alpha for 600Hz cutoff at 22050Hz sample rate:
+// alpha = 2*PI*600 / (2*PI*600 + 22050) ≈ 0.146
+// Lower cutoff = more of the audible range is in "treble" → bigger effect on cheap speakers
+#define LP_ALPHA 0.146f
+float lpStateL = 0.0f;   // low-pass filter state, left channel
+float lpStateR = 0.0f;   // low-pass filter state, right channel
 
-// Front sensors: Chorus thickening (short delay ~25ms = 551 frames)
-#define CHORUS_DELAY_FRAMES 551
-volatile float chorusWet = 0.0f;     // 0.0=none, up to 0.35
-
-// Back sensors: Rhythmic echo bounce (long delay ~250ms = 5512 frames)
-#define ECHO_DELAY_FRAMES 5512
-volatile float echoWet = 0.0f;       // 0.0=none, up to 0.40
-
-// Song volume controlled by front sensors
-volatile float songVolScale = 0.4f;  // 0.4 baseline, up to 1.0 with sensor press
+// Sensor-controlled band levels:
+// At rest: song sounds muffled (treble low) and thin (bass reduced)
+// Walking: restores full frequency range
+volatile float trebleLevel = 0.2f;   // 0.2 base → 1.0 (front sensors restore brightness)
+volatile float bassLevel = 0.5f;     // 0.5 base → 1.0 (back sensors restore warmth)
 
 #define I2S_BCLK_PIN  GPIO_NUM_27
 #define I2S_WS_PIN    GPIO_NUM_14
@@ -123,13 +123,13 @@ void generateAccordionWavetable() {
   Serial.println("Accordion wavetable generated.");
 }
 
-// ---------- Delay Buffer Init ----------
-void initDelayBuffer() {
-  memset(delayBuffer, 0, sizeof(delayBuffer));
-  delayWritePos = 0;
-  chorusWet = 0.0f;
-  echoWet = 0.0f;
-  Serial.println("Delay buffer initialized (chorus 25ms + echo 250ms).");
+// ---------- Filter State Reset ----------
+void resetFilterState() {
+  lpStateL = 0.0f;
+  lpStateR = 0.0f;
+  trebleLevel = 0.2f;
+  bassLevel = 0.5f;
+  Serial.println("Filter initialized (bass/treble split at 800Hz).");
 }
 
 // ---------- Song File Helper ----------
@@ -181,38 +181,30 @@ void audioTask(void *parameter) {
         }
       }
 
-      float sv = songVolScale * masterVol;
-      float chWet = chorusWet;
-      float ecWet = echoWet;
+      float mv = masterVol;
+      float bLvl = bassLevel;
+      float tLvl = trebleLevel;
 
       for (int f = 0; f < (int)numFrames; f++) {
         int idx = f * 2;
+        float rawL = (float)songBuf[idx];
+        float rawR = (float)songBuf[idx + 1];
 
-        // Current song samples (volume-scaled)
-        float outL = (float)songBuf[idx] * sv;
-        float outR = (float)songBuf[idx + 1] * sv;
+        // Single-pole low-pass filter: splits into bass + treble
+        lpStateL += LP_ALPHA * (rawL - lpStateL);
+        lpStateR += LP_ALPHA * (rawR - lpStateR);
 
-        // --- Read from BOTH delay positions (additive enrichment only!) ---
-        // Chorus: read from 25ms ago → thickens the sound
-        int chorusReadPos = (delayWritePos - CHORUS_DELAY_FRAMES + DELAY_BUF_FRAMES) % DELAY_BUF_FRAMES;
-        float chorusL = (float)delayBuffer[chorusReadPos * 2] * sv;
-        float chorusR = (float)delayBuffer[chorusReadPos * 2 + 1] * sv;
+        // Bass = low-pass output (frequencies below ~800Hz)
+        // Treble = original minus low-pass (frequencies above ~800Hz)
+        float bassL = lpStateL;
+        float bassR = lpStateR;
+        float trebL = rawL - lpStateL;
+        float trebR = rawR - lpStateR;
 
-        // Echo: read from 250ms ago → adds rhythmic bounce
-        int echoReadPos = (delayWritePos - ECHO_DELAY_FRAMES + DELAY_BUF_FRAMES) % DELAY_BUF_FRAMES;
-        float echoL = (float)delayBuffer[echoReadPos * 2] * sv;
-        float echoR = (float)delayBuffer[echoReadPos * 2 + 1] * sv;
-
-        // Write current RAW song samples into delay buffer
-        delayBuffer[delayWritePos * 2]     = songBuf[idx];
-        delayBuffer[delayWritePos * 2 + 1] = songBuf[idx + 1];
-        delayWritePos = (delayWritePos + 1) % DELAY_BUF_FRAMES;
-
-        // ADD effects to the song (never subtract!)
-        outL += chorusL * chWet;  // front: chorus thickening
-        outR += chorusR * chWet;
-        outL += echoL * ecWet;    // back: rhythmic echo bounce
-        outR += echoR * ecWet;
+        // Reconstruct: sensor-controlled mix of bass + treble
+        // At rest: muffled (low treble). Walking: full spectrum restored.
+        float outL = (bassL * bLvl + trebL * tLvl) * mv;
+        float outR = (bassR * bLvl + trebR * tLvl) * mv;
 
         // Clamp output
         int32_t iL = (int32_t)outL;
@@ -396,13 +388,10 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
           voices[i].targetVol = 0.0f;
         }
         // Reset song manipulation effects
-        chorusWet = 0.0f;
-        echoWet = 0.0f;
-        initDelayBuffer();
-        songVolScale = 0.4f;
+        resetFilterState();
         openSongFile();
         audioMode = 1;
-        Serial.println("Mode: Song + Echo/Tremolo manipulation");
+        Serial.println("Mode: Song + Frequency Filter (walk to restore)");
       }
     }
   }
@@ -428,7 +417,7 @@ void setup() {
 
   // ---------- Synthesis Setup ----------
   generateAccordionWavetable();
-  initDelayBuffer();
+  resetFilterState();
   for (int i = 0; i < NUM_VOICES; i++) {
     voices[i].phaseAccumulator = 0.0f;
     voices[i].phaseIncrement = (noteFreqs[i] * WAVETABLE_SIZE) / (float)SAMPLE_RATE;
@@ -545,17 +534,15 @@ void loop() {
         }
       }
 
-      // Front sensors → chorus thickening + volume swell (ADDITIVE enrichment)
+      // Front sensors → restore TREBLE (brightness/detail)
       if (frontActive > 0) {
         float avgForce = frontForceSum / (float)frontActive;
-        chorusWet = avgForce * 0.35f;            // up to 35% chorus → thicker sound
-        songVolScale = 0.4f + avgForce * 0.6f;   // 40-100% volume (wider range)
+        trebleLevel = 0.2f + avgForce * 0.8f;    // 0.2 → 1.0 (muffled → bright)
       } else {
-        chorusWet = 0.0f;
-        songVolScale = 0.4f;
+        trebleLevel = 0.2f;
       }
 
-      // Back sensors (2,3): control rhythmic echo bounce (ADDITIVE enrichment)
+      // Back sensors (2,3): restore BASS (warmth/depth)
       float backForceMax = 0.0f;
       for (int i = 2; i < 4; i++) {
         int force = sensorValues[i] - sensorBaselines[i];
@@ -568,14 +555,15 @@ void loop() {
           if (normalizedForce > backForceMax) backForceMax = normalizedForce;
         }
       }
-      // Back sensors → echo bounce: adds a musical repeat of the song
-      echoWet = backForceMax * 0.40f;  // up to 40% echo → rhythmic bounce
+      // Back sensors → bass restored: thin → full warmth
+      bassLevel = 0.5f + backForceMax * 0.5f;    // 0.5 → 1.0
     }
   } else {
     for (int i = 0; i < NUM_VOICES; i++) {
       voices[i].targetVol = 0.0f;
     }
-    songVolScale = 0.4f;
+    trebleLevel = 0.2f;
+    bassLevel = 0.5f;
   }
 
   // ---- BLE Logic ----
