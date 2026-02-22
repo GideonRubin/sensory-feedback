@@ -6,8 +6,7 @@
   "scripts": {
     "dev": "vite",
     "dev -stubs": "VITE_USE_STUBS=true vite",
-    "start": "vite",
-    "start -stubs": "VITE_USE_STUBS=true vite",
+    "start": "npx serve dist -s -l tcp://0.0.0.0:${PORT:-3000}",
     "test": "VITE_USE_STUBS=true vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
