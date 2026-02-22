@@ -574,6 +574,14 @@ void loop() {
           float normalizedForce = (float)force / maxRange;
           if (normalizedForce > 1.0f) normalizedForce = 1.0f;
 
+          // Front sensors (0,1): sqrt curve — very sensitive to light touch
+          // Back sensors (2,3): squared curve — needs firmer press
+          if (i < 2) {
+            normalizedForce = sqrtf(normalizedForce);
+          } else {
+            normalizedForce = normalizedForce * normalizedForce;
+          }
+
           float baseVolume = 0.3f + (normalizedForce * 0.7f);
           voices[i].targetVol = baseVolume * sensorMaxVol[i] * masterVol;
           if (voices[i].targetVol > 1.0f) voices[i].targetVol = 1.0f;
@@ -588,13 +596,16 @@ void loop() {
 
       // Helper: update a band level with hold+decay logic
       // Returns the new output level
-      #define UPDATE_BAND(sensorIdx, baseVal, hold, outVar) do { \
+      // CURVE param: expression applied to nf after normalization
+      // Front = sqrtf(nf) → very responsive, Back = (nf*nf) → needs firm press
+      #define UPDATE_BAND(sensorIdx, baseVal, hold, outVar, CURVE) do { \
         int force = sensorValues[sensorIdx] - sensorBaselines[sensorIdx]; \
         if (force < 0) force = 0; \
         if (force > sensorThresholds[sensorIdx]) { \
           float maxRange = 4095.0f - sensorBaselines[sensorIdx]; \
           float nf = (float)force / maxRange; \
           if (nf > 1.0f) nf = 1.0f; \
+          nf = CURVE; \
           float level = baseVal + nf * (1.0f - baseVal); \
           hold.peak = level; \
           hold.lastActive = now; \
@@ -612,14 +623,12 @@ void loop() {
         } \
       } while(0)
 
-      // Sensor 0 (Right Front) → treble on RIGHT speaker
-      UPDATE_BAND(0, TREBLE_BASE, holdTrebleR, trebleLvlR);
-      // Sensor 1 (Left Front) → treble on LEFT speaker
-      UPDATE_BAND(1, TREBLE_BASE, holdTrebleL, trebleLvlL);
-      // Sensor 2 (Right Back) → bass on RIGHT speaker
-      UPDATE_BAND(2, BASS_BASE, holdBassR, bassLvlR);
-      // Sensor 3 (Left Back) → bass on LEFT speaker
-      UPDATE_BAND(3, BASS_BASE, holdBassL, bassLvlL);
+      // Front sensors: sqrt curve — light touch gives strong response
+      UPDATE_BAND(0, TREBLE_BASE, holdTrebleR, trebleLvlR, sqrtf(nf));
+      UPDATE_BAND(1, TREBLE_BASE, holdTrebleL, trebleLvlL, sqrtf(nf));
+      // Back sensors: squared curve — needs firmer press
+      UPDATE_BAND(2, BASS_BASE, holdBassR, bassLvlR, (nf * nf));
+      UPDATE_BAND(3, BASS_BASE, holdBassL, bassLvlL, (nf * nf));
     }
   } else {
     for (int i = 0; i < NUM_VOICES; i++) {
