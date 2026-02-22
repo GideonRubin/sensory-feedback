@@ -34,6 +34,8 @@ const float noteFreqs[NUM_VOICES] = {
 struct Voice {
   float phaseAccumulator;
   float phaseIncrement;
+  float phase2;            // second detuned oscillator for natural beating
+  float phaseInc2;         // slightly different frequency (± cents)
   volatile float targetVol;
   float currentVol;
   float panL;
@@ -41,6 +43,11 @@ struct Voice {
 };
 
 Voice voices[NUM_VOICES];
+
+// Tremolo LFO for bellows simulation (~5Hz gentle wobble)
+float tremoloPhase = 0.0f;
+#define TREMOLO_RATE  (5.0f * WAVETABLE_SIZE / (float)SAMPLE_RATE)  // 5Hz in phase increments
+#define TREMOLO_DEPTH 0.08f   // subtle ±8% volume modulation
 
 // ---------- Audio Mode ----------
 volatile int audioMode = 0;  // 0 = accordion, 1 = song + enrichment
@@ -113,10 +120,11 @@ bool oldDeviceConnected = false;
 
 // ---------- Wavetable Generation ----------
 void generateAccordionWavetable() {
-  // Accordion/reed organ: strong odd harmonics for reedy timbre
+  // Warmer accordion timbre: strong fundamental, gentle harmonic rolloff
+  // Real accordion reeds have a warm, full tone — not overly buzzy
   const int numHarmonics = 8;
   const float harmonicNum[] = {1, 2, 3, 4, 5, 6, 7, 8};
-  const float harmonicAmp[] = {1.0f, 0.5f, 0.7f, 0.3f, 0.4f, 0.15f, 0.2f, 0.1f};
+  const float harmonicAmp[] = {1.0f, 0.6f, 0.35f, 0.2f, 0.12f, 0.08f, 0.05f, 0.03f};
 
   float rawTable[WAVETABLE_SIZE];
   float peak = 0.0f;
@@ -181,7 +189,8 @@ void audioTask(void *parameter) {
 
   i2s_channel_enable(tx_handle);
 
-  const float attackAlpha  = 0.005f;
+  // Smoother attack for more natural onset (real bellows take time to build pressure)
+  const float attackAlpha  = 0.003f;
   const float releaseAlpha = 0.0008f;
 
   while (true) {
@@ -233,11 +242,16 @@ void audioTask(void *parameter) {
       }
     }
 
-    // ---- Mode 0: Accordion wavetable synthesis (all 4 voices) ----
+    // ---- Mode 0: Accordion wavetable synthesis (dual detuned oscillators + tremolo) ----
     if (currentMode == 0) {
+      // Tremolo LFO: gentle bellows simulation
+      float tPhase = tremoloPhase;
+
       for (int v = 0; v < NUM_VOICES; v++) {
         float phase = voices[v].phaseAccumulator;
         float phaseInc = voices[v].phaseIncrement;
+        float phase2 = voices[v].phase2;
+        float phaseInc2 = voices[v].phaseInc2;
         float target = voices[v].targetVol;
         float current = voices[v].currentVol;
         float panL = voices[v].panL;
@@ -247,27 +261,54 @@ void audioTask(void *parameter) {
           float alpha = (target > current) ? attackAlpha : releaseAlpha;
           current += alpha * (target - current);
 
+          // First oscillator (slightly flat)
           int idx0 = (int)phase;
           int idx1 = (idx0 + 1) & (WAVETABLE_SIZE - 1);
           float frac = phase - (float)idx0;
           idx0 &= (WAVETABLE_SIZE - 1);
+          float sample1 = (float)wavetable[idx0] + frac * (float)(wavetable[idx1] - wavetable[idx0]);
 
-          float sample = (float)wavetable[idx0] + frac * (float)(wavetable[idx1] - wavetable[idx0]);
-          float out = sample * current;
+          // Second oscillator (slightly sharp) — creates natural beating
+          int idx2 = (int)phase2;
+          int idx3 = (idx2 + 1) & (WAVETABLE_SIZE - 1);
+          float frac2 = phase2 - (float)idx2;
+          idx2 &= (WAVETABLE_SIZE - 1);
+          float sample2 = (float)wavetable[idx2] + frac2 * (float)(wavetable[idx3] - wavetable[idx2]);
+
+          // Mix both oscillators (equal blend for chorus effect)
+          float sample = (sample1 + sample2) * 0.5f;
+
+          // Apply tremolo (bellows wobble) — only when voice is active
+          float tIdx = (int)tPhase & (WAVETABLE_SIZE - 1);
+          float tFrac = tPhase - (float)(int)tPhase;
+          int tIdx1 = ((int)tPhase + 1) & (WAVETABLE_SIZE - 1);
+          float lfo = (float)wavetable[(int)tIdx] + tFrac * (float)(wavetable[tIdx1] - wavetable[(int)tIdx]);
+          // Normalize LFO to -1..+1 range (wavetable peak is ~8191 with 0.25 scale)
+          float tremoloMod = 1.0f + (lfo / 8192.0f) * TREMOLO_DEPTH;
+
+          float out = sample * current * tremoloMod;
 
           int bufIdx = f * 2;
           buffer[bufIdx]     += (int16_t)(out * panL);
           buffer[bufIdx + 1] += (int16_t)(out * panR);
 
           phase += phaseInc;
-          if (phase >= (float)WAVETABLE_SIZE) {
-            phase -= (float)WAVETABLE_SIZE;
+          if (phase >= (float)WAVETABLE_SIZE) phase -= (float)WAVETABLE_SIZE;
+          phase2 += phaseInc2;
+          if (phase2 >= (float)WAVETABLE_SIZE) phase2 -= (float)WAVETABLE_SIZE;
+
+          // Advance tremolo (shared across all voices, only increment once)
+          if (v == 0) {
+            tPhase += TREMOLO_RATE;
+            if (tPhase >= (float)WAVETABLE_SIZE) tPhase -= (float)WAVETABLE_SIZE;
           }
         }
 
         voices[v].phaseAccumulator = phase;
+        voices[v].phase2 = phase2;
         voices[v].currentVol = current;
       }
+      tremoloPhase = tPhase;
     }
 
     // Clamp to prevent overflow (Mode 0 accumulates, Mode 1 already clamped inline)
@@ -395,9 +436,12 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
       if (mode == 0) {
         audioMode = 0;
         if (songFileOpen) { songFile.close(); songFileOpen = false; }
-        // Restore accordion frequencies
+        // Restore accordion frequencies with detuning
+        const float dr = powf(2.0f, 4.0f / 1200.0f);
         for (int i = 0; i < NUM_VOICES; i++) {
-          voices[i].phaseIncrement = (noteFreqs[i] * WAVETABLE_SIZE) / (float)SAMPLE_RATE;
+          float freq = noteFreqs[i];
+          voices[i].phaseIncrement = (freq / dr * WAVETABLE_SIZE) / (float)SAMPLE_RATE;
+          voices[i].phaseInc2 = (freq * dr * WAVETABLE_SIZE) / (float)SAMPLE_RATE;
           voices[i].targetVol = 0.0f;
         }
         Serial.println("Mode: Accordion");
@@ -437,14 +481,21 @@ void setup() {
   // ---------- Synthesis Setup ----------
   generateAccordionWavetable();
   resetFilterState();
+  // Detuning: ±4 cents creates the classic accordion "beating" between two reeds
+  // cents-to-ratio: 2^(cents/1200)
+  const float detuneRatio = powf(2.0f, 4.0f / 1200.0f);  // ~1.00231
+
   for (int i = 0; i < NUM_VOICES; i++) {
+    float freq = noteFreqs[i];
     voices[i].phaseAccumulator = 0.0f;
-    voices[i].phaseIncrement = (noteFreqs[i] * WAVETABLE_SIZE) / (float)SAMPLE_RATE;
+    voices[i].phaseIncrement = (freq / detuneRatio * WAVETABLE_SIZE) / (float)SAMPLE_RATE;  // slightly flat
+    voices[i].phase2 = 0.0f;
+    voices[i].phaseInc2 = (freq * detuneRatio * WAVETABLE_SIZE) / (float)SAMPLE_RATE;       // slightly sharp
     voices[i].targetVol = 0.0f;
     voices[i].currentVol = 0.0f;
-    // Right foot sensors (0,2) -> left speaker, Left foot sensors (1,3) -> right speaker
-    voices[i].panL = (i == 0 || i == 2) ? 1.0f : 0.0f;
-    voices[i].panR = (i == 0 || i == 2) ? 0.0f : 1.0f;
+    // Right foot sensors (0,2) -> right speaker, Left foot sensors (1,3) -> left speaker
+    voices[i].panL = (i == 1 || i == 3) ? 1.0f : 0.0f;
+    voices[i].panR = (i == 0 || i == 2) ? 1.0f : 0.0f;
   }
 
   // ---------- I2S Setup ----------
