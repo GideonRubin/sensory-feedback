@@ -7,6 +7,7 @@ export const COMMAND_CHARACTERISTIC_UUID = "19b10002-e8f2-537e-4f6c-d104768a1214
 
 type SensorCallback = (value: string) => void;
 type DisconnectCallback = () => void;
+type ReconnectCallback = (state: 'reconnecting' | 'reconnected' | 'failed') => void;
 
 interface IBleService {
   connect(): Promise<void>;
@@ -17,6 +18,7 @@ interface IBleService {
   subscribeToSensor(callback: SensorCallback): void;
   unsubscribeFromSensor(callback: SensorCallback): void;
   onDisconnect(callback: DisconnectCallback): void;
+  onReconnect(callback: ReconnectCallback): void;
 }
 
 class BleService implements IBleService {
@@ -26,7 +28,12 @@ class BleService implements IBleService {
   private commandCharacteristic: BluetoothRemoteGATTCharacteristic | null = null;
   private sensorCallbacks: SensorCallback[] = [];
   private disconnectCallbacks: DisconnectCallback[] = [];
-  private writeQueue: Promise<void> = Promise.resolve(); // Serialize BLE writes
+  private reconnectCallbacks: ReconnectCallback[] = [];
+  private writeQueue: Promise<void> = Promise.resolve();
+  private manualDisconnect = false;        // true = user clicked disconnect
+  private reconnecting = false;
+  private static MAX_RECONNECT_ATTEMPTS = 5;
+  private static RECONNECT_DELAYS = [1000, 2000, 3000, 5000, 8000]; // backoff
 
   constructor() {
     this.handleSensorChanged = this.handleSensorChanged.bind(this);
@@ -46,21 +53,8 @@ class BleService implements IBleService {
       });
 
       this.device.addEventListener('gattserverdisconnected', this.handleDisconnected);
-
-      console.log('Connecting to GATT Server...');
-      this.server = await this.device.gatt!.connect();
-
-      console.log('Getting Service...');
-      const service = await this.server.getPrimaryService(SERVICE_UUID);
-
-      console.log('Getting Characteristics...');
-      this.sensorCharacteristic = await service.getCharacteristic(SENSOR_CHARACTERISTIC_UUID);
-      this.commandCharacteristic = await service.getCharacteristic(COMMAND_CHARACTERISTIC_UUID);
-
-      console.log('Starting Notifications...');
-      await this.sensorCharacteristic.startNotifications();
-      this.sensorCharacteristic.addEventListener('characteristicvaluechanged', this.handleSensorChanged);
-
+      this.manualDisconnect = false;
+      await this.connectGatt();
       console.log('Connected!');
     } catch (error) {
       console.error('Connection failed', error);
@@ -68,7 +62,30 @@ class BleService implements IBleService {
     }
   }
 
+  // Internal: connect GATT + setup characteristics + start notifications
+  // Reused by both initial connect and auto-reconnect
+  private async connectGatt(): Promise<void> {
+    console.log('Connecting to GATT Server...');
+    this.server = await this.device!.gatt!.connect();
+
+    console.log('Getting Service...');
+    const service = await this.server.getPrimaryService(SERVICE_UUID);
+
+    console.log('Getting Characteristics...');
+    this.sensorCharacteristic = await service.getCharacteristic(SENSOR_CHARACTERISTIC_UUID);
+    this.commandCharacteristic = await service.getCharacteristic(COMMAND_CHARACTERISTIC_UUID);
+
+    console.log('Starting Notifications...');
+    await this.sensorCharacteristic.startNotifications();
+    this.sensorCharacteristic.addEventListener('characteristicvaluechanged', this.handleSensorChanged);
+
+    // Reset write queue for clean state
+    this.writeQueue = Promise.resolve();
+  }
+
   disconnect(): void {
+    this.manualDisconnect = true;   // prevent auto-reconnect
+    this.reconnecting = false;
     if (this.device && this.device.gatt?.connected) {
       this.device.gatt.disconnect();
     }
@@ -83,10 +100,8 @@ class BleService implements IBleService {
       console.warn('Not connected or characteristic not found');
       return;
     }
-    // Queue writes to prevent "GATT operation already in progress" errors
     const doWrite = async () => {
       if (!this.commandCharacteristic || !this.isConnected()) return;
-      // Timeout to prevent stuck writes from blocking the queue
       const timeout = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error('BLE write timeout')), 3000)
       );
@@ -100,7 +115,7 @@ class BleService implements IBleService {
     });
     return this.writeQueue;
   }
-  
+
   async read(): Promise<Uint8Array> {
       if (!this.commandCharacteristic) {
         console.warn('Command Characteristic not found');
@@ -124,7 +139,6 @@ class BleService implements IBleService {
     if (value) {
       const decoder = new TextDecoder('utf-8');
       const stringValue = decoder.decode(value);
-      // console.log('Received sensor data:', stringValue);
       this.sensorCallbacks.forEach(cb => cb(stringValue));
     }
   }
@@ -133,8 +147,60 @@ class BleService implements IBleService {
     this.disconnectCallbacks.push(callback);
   }
 
+  onReconnect(callback: ReconnectCallback): void {
+    this.reconnectCallbacks.push(callback);
+  }
+
   private handleDisconnected(_event: Event): void {
-    console.log('Device disconnected');
+    console.log('Device disconnected', this.manualDisconnect ? '(manual)' : '(unexpected)');
+
+    if (this.manualDisconnect) {
+      // User clicked disconnect — notify and don't reconnect
+      this.disconnectCallbacks.forEach(cb => cb());
+      return;
+    }
+
+    // Unexpected disconnect (range loss, interference) — auto-reconnect
+    this.attemptReconnect();
+  }
+
+  private async attemptReconnect(): Promise<void> {
+    if (this.reconnecting || !this.device) return;
+    this.reconnecting = true;
+    this.reconnectCallbacks.forEach(cb => cb('reconnecting'));
+
+    for (let attempt = 0; attempt < BleService.MAX_RECONNECT_ATTEMPTS; attempt++) {
+      if (this.manualDisconnect) {
+        // User manually disconnected during reconnect — stop
+        this.reconnecting = false;
+        return;
+      }
+
+      const delay = BleService.RECONNECT_DELAYS[attempt] || 8000;
+      console.log(`Reconnect attempt ${attempt + 1}/${BleService.MAX_RECONNECT_ATTEMPTS} in ${delay}ms...`);
+      await new Promise(r => setTimeout(r, delay));
+
+      // Check again in case user disconnected during wait
+      if (this.manualDisconnect) {
+        this.reconnecting = false;
+        return;
+      }
+
+      try {
+        await this.connectGatt();
+        console.log('Reconnected successfully!');
+        this.reconnecting = false;
+        this.reconnectCallbacks.forEach(cb => cb('reconnected'));
+        return;
+      } catch (err) {
+        console.warn(`Reconnect attempt ${attempt + 1} failed:`, err);
+      }
+    }
+
+    // All attempts failed — give up and notify disconnect
+    console.log('Auto-reconnect failed after all attempts');
+    this.reconnecting = false;
+    this.reconnectCallbacks.forEach(cb => cb('failed'));
     this.disconnectCallbacks.forEach(cb => cb());
   }
 }
@@ -205,6 +271,10 @@ class BleStubService implements IBleService {
 
   onDisconnect(callback: DisconnectCallback): void {
     this.disconnectCallbacks.push(callback);
+  }
+
+  onReconnect(_callback: ReconnectCallback): void {
+    // Stub doesn't auto-reconnect
   }
 
   // ---------- Simulation Engine ----------

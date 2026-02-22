@@ -96,6 +96,9 @@ export const EspApi = {
   onDisconnect: (callback: () => void): void => {
     bleService.onDisconnect(callback);
   },
+  onReconnect: (callback: (state: 'reconnecting' | 'reconnected' | 'failed') => void): void => {
+    bleService.onReconnect(callback);
+  },
   connect: async (): Promise<void> => {
     await bleService.connect();
     bleService.subscribeToSensor((jsonString) => {

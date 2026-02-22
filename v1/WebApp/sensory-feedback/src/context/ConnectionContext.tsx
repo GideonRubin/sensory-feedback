@@ -3,6 +3,7 @@ import { EspApi } from '../services/api';
 
 interface ConnectionContextType {
   isConnected: boolean;
+  isReconnecting: boolean;
   connect: () => Promise<void>;
   disconnect: () => void;
 }
@@ -11,13 +12,30 @@ const ConnectionContext = createContext<ConnectionContextType | undefined>(undef
 
 export function ConnectionProvider({ children }: { children: React.ReactNode }) {
   const [isConnected, setIsConnected] = useState(false);
+  const [isReconnecting, setIsReconnecting] = useState(false);
 
   useEffect(() => {
     // Initial check
     setIsConnected(EspApi.isConnected());
-    // Listen for unexpected BLE disconnections
+
+    // Listen for manual/final disconnections (after auto-reconnect gives up)
     EspApi.onDisconnect(() => {
       setIsConnected(false);
+      setIsReconnecting(false);
+    });
+
+    // Listen for auto-reconnect lifecycle
+    EspApi.onReconnect((state) => {
+      if (state === 'reconnecting') {
+        setIsReconnecting(true);
+        // Don't set isConnected=false — UI shows "reconnecting" overlay instead
+      } else if (state === 'reconnected') {
+        setIsReconnecting(false);
+        setIsConnected(true);
+      } else if (state === 'failed') {
+        setIsReconnecting(false);
+        // disconnectCallbacks will fire separately → setIsConnected(false)
+      }
     });
   }, []);
 
@@ -29,10 +47,11 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
   const disconnect = () => {
     EspApi.disconnect();
     setIsConnected(false);
+    setIsReconnecting(false);
   };
 
   return (
-    <ConnectionContext.Provider value={{ isConnected, connect, disconnect }}>
+    <ConnectionContext.Provider value={{ isConnected, isReconnecting, connect, disconnect }}>
       {children}
     </ConnectionContext.Provider>
   );
