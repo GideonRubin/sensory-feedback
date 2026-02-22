@@ -63,6 +63,11 @@ File songFile;
 bool songFileOpen = false;
 #define WAV_HEADER_SIZE 44
 
+// SD file operation flags — BLE callback (Core 0) sets these,
+// audio task (Core 1) executes them. Prevents cross-core SPI crash.
+volatile bool needOpenSong = false;
+volatile bool needCloseSong = false;
+
 // Mode 1: Per-channel frequency-band filtering with hold+decay
 // Right foot → right speaker, Left foot → left speaker
 // Walking restores filtered frequencies, holds 1.5s, then decays
@@ -200,11 +205,23 @@ void audioTask(void *parameter) {
   const float releaseAlpha = 0.0008f;
 
   while (true) {
+    // Handle SD file operations on this core (Core 1) to avoid cross-core SPI crash
+    if (needCloseSong) {
+      needCloseSong = false;
+      if (songFileOpen) { songFile.close(); songFileOpen = false; }
+      Serial.println("Song file closed (audio task)");
+    }
+    if (needOpenSong) {
+      needOpenSong = false;
+      openSongFile();
+      Serial.println("Song file opened (audio task)");
+    }
+
     memset(buffer, 0, bufSize);
 
     int currentMode = audioMode;
 
-    // ---- Mode 1: Song + Echo/Doubling + Tremolo (song manipulation) ----
+    // ---- Mode 1: Song + frequency filter ----
     if (currentMode == 1 && songFileOpen) {
       size_t bytesRead = songFile.read((uint8_t*)songBuf, bufSize);
       if (bytesRead < bufSize) {
@@ -436,7 +453,7 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
       int mode = data.toInt();
       if (mode == 0) {
         audioMode = 0;
-        if (songFileOpen) { songFile.close(); songFileOpen = false; }
+        needCloseSong = true;  // Audio task will close file on Core 1
         // Restore accordion frequencies with detuning
         const float dr = powf(2.0f, 4.0f / 1200.0f);
         for (int i = 0; i < NUM_VOICES; i++) {
@@ -451,11 +468,10 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
         for (int i = 0; i < NUM_VOICES; i++) {
           voices[i].targetVol = 0.0f;
         }
-        // Reset song manipulation effects
         resetFilterState();
-        openSongFile();
+        needOpenSong = true;  // Audio task will open file on Core 1
         audioMode = 1;
-        Serial.println("Mode: Song + Frequency Filter (walk to restore)");
+        Serial.println("Mode: Song (file will open on audio core)");
       }
     }
     else if (command == "SENSITIVITY") {
