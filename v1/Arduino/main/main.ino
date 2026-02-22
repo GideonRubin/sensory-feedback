@@ -11,15 +11,36 @@
 #include "driver/i2s_std.h"
 
 // ---------- Audio & Pin Configuration ----------
-// CHANGE: Removed 'const', made volatile so it can change dynamically
-volatile float VOL = 1.0f; 
-// Store max volume per sensor (0.0 to 100.0 from app -> normalized 0.0 to 1.0 or similar)
-// User wants 100 as max, 0 as min. We'll store as float 0.0-1.0 for calculation.
 volatile float sensorMaxVol[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-volatile int sensorBaselines[4] = {300, 300, 300, 300}; // ערכי ברירת מחדל עד לכיול הראשון
-volatile int sensorThresholds[4] = {20, 20, 20, 20};   // סף הפעלה לכל חיישן (ביח' ADC)
-volatile float masterVol = 1.0f;                        // עוצמת שמע כללית (0.0-1.0)
-volatile bool systemOn = true; // Default to TRUE (On) as per user request (switched off only via button)
+volatile int sensorBaselines[4] = {300, 300, 300, 300};
+volatile int sensorThresholds[4] = {150, 150, 150, 150};
+volatile float masterVol = 1.0f;
+volatile bool systemOn = true;
+
+// ---------- Wavetable Synthesis ----------
+#define WAVETABLE_SIZE 256
+#define NUM_VOICES 4
+#define SAMPLE_RATE 22050
+
+int16_t wavetable[WAVETABLE_SIZE];
+
+const float noteFreqs[NUM_VOICES] = {
+  261.63f,  // C4 - Sensor 0 (Right Front)
+  329.63f,  // E4 - Sensor 1 (Left Front)
+  392.00f,  // G4 - Sensor 2 (Right Back)
+  523.25f   // C5 - Sensor 3 (Left Back)
+};
+
+struct Voice {
+  float phaseAccumulator;
+  float phaseIncrement;
+  volatile float targetVol;
+  float currentVol;
+  float panL;
+  float panR;
+};
+
+Voice voices[NUM_VOICES];
 
 #define I2S_BCLK_PIN  GPIO_NUM_27
 #define I2S_WS_PIN    GPIO_NUM_14
@@ -34,9 +55,6 @@ const int sensorPins[] = {34, 35, 32, 33};
 const int numSensors = 4;
 const int ledPin = 2; // Use the appropriate GPIO pin for your setup
 
-// Audio Task Globals
-volatile int targetTrack = 0;   
-volatile float targetPan = 0.5f;
 i2s_chan_handle_t tx_handle = NULL;
 
 // ---------- BLE State ----------
@@ -52,97 +70,100 @@ bool oldDeviceConnected = false;
 #define SENSOR_CHARACTERISTIC_UUID "19b10001-e8f2-537e-4f6c-d104768a1214"
 #define LED_CHARACTERISTIC_UUID "19b10002-e8f2-537e-4f6c-d104768a1214"
 
-// ---------- Audio Task ----------
+// ---------- Wavetable Generation ----------
+void generateAccordionWavetable() {
+  // Accordion/reed organ: strong odd harmonics for reedy timbre
+  const int numHarmonics = 8;
+  const float harmonicNum[] = {1, 2, 3, 4, 5, 6, 7, 8};
+  const float harmonicAmp[] = {1.0f, 0.5f, 0.7f, 0.3f, 0.4f, 0.15f, 0.2f, 0.1f};
+
+  float rawTable[WAVETABLE_SIZE];
+  float peak = 0.0f;
+
+  for (int i = 0; i < WAVETABLE_SIZE; i++) {
+    float sample = 0.0f;
+    float phase = (float)i / WAVETABLE_SIZE * 2.0f * PI;
+    for (int h = 0; h < numHarmonics; h++) {
+      sample += harmonicAmp[h] * sinf(harmonicNum[h] * phase);
+    }
+    rawTable[i] = sample;
+    if (fabsf(sample) > peak) peak = fabsf(sample);
+  }
+
+  // Scale so 4 voices at max sum to 32767
+  float scale = (32767.0f * 0.25f) / peak;
+  for (int i = 0; i < WAVETABLE_SIZE; i++) {
+    wavetable[i] = (int16_t)(rawTable[i] * scale);
+  }
+  Serial.println("Accordion wavetable generated.");
+}
+
+// ---------- Audio Task (Synthesis) ----------
 void audioTask(void *parameter) {
-  File wavFile;
-  // Increase buffer size slightly for stability if needed, or keep 512
-  const size_t bufSize = 1024; 
+  const size_t numFrames = 256;
+  const size_t bufSize = numFrames * 2 * sizeof(int16_t); // stereo 16-bit
   int16_t *buffer = (int16_t *)heap_caps_malloc(bufSize, MALLOC_CAP_DMA);
-  
+
   if (buffer == NULL) {
     Serial.println("Failed to allocate audio buffer");
     vTaskDelete(NULL);
     return;
   }
 
-  int currentTrackID = 0;
-  bool firstBuffer = false;
-  
-  // Enable the channel
   i2s_channel_enable(tx_handle);
 
+  const float attackAlpha  = 0.005f;
+  const float releaseAlpha = 0.0008f;
+
   while (true) {
-    // Check global systemOn flag (extern or just check targetTrack which is 0 when off)
-    // If we want to completely stop playing even silence when off, we could check systemOn.
-    // However, I2S usually needs a steady stream to avoid pops when resuming.
-    // Writing 0s (silence) is the standard way to "not play". 
-    // If we stop writing, the I2S DMA buffer might run dry or emit noise.
-    
-    // Check if we need to switch tracks
-    if (targetTrack != currentTrackID) {
-      if (wavFile) wavFile.close();
-      currentTrackID = targetTrack;
-      
-      if (currentTrackID > 0) {
-        char path[16];
-        // Format: /0001.wav, /0002.wav, etc. matches common SD structure
-        snprintf(path, sizeof(path), "/%04d.wav", currentTrackID);
-        
-        if (SD.exists(path)) {
-            wavFile = SD.open(path);
-            if (wavFile) {
-              // Skip WAV header (typical 44 bytes)
-              wavFile.seek(44);
-              firstBuffer = true; 
-            } else {
-              currentTrackID = 0;
-            }
-        } else {
-            // File doesn't exist
-            currentTrackID = 0;
+    memset(buffer, 0, bufSize);
+
+    for (int v = 0; v < NUM_VOICES; v++) {
+      float phase = voices[v].phaseAccumulator;
+      float phaseInc = voices[v].phaseIncrement;
+      float target = voices[v].targetVol;
+      float current = voices[v].currentVol;
+      float panL = voices[v].panL;
+      float panR = voices[v].panR;
+
+      for (int f = 0; f < (int)numFrames; f++) {
+        // Per-sample volume smoothing
+        float alpha = (target > current) ? attackAlpha : releaseAlpha;
+        current += alpha * (target - current);
+
+        // Wavetable lookup with linear interpolation
+        int idx0 = (int)phase;
+        int idx1 = (idx0 + 1) & (WAVETABLE_SIZE - 1);
+        float frac = phase - (float)idx0;
+        idx0 &= (WAVETABLE_SIZE - 1);
+
+        float sample = (float)wavetable[idx0] + frac * (float)(wavetable[idx1] - wavetable[idx0]);
+        float out = sample * current;
+
+        // Mix into stereo buffer
+        int bufIdx = f * 2;
+        buffer[bufIdx]     += (int16_t)(out * panL);
+        buffer[bufIdx + 1] += (int16_t)(out * panR);
+
+        // Advance phase
+        phase += phaseInc;
+        if (phase >= (float)WAVETABLE_SIZE) {
+          phase -= (float)WAVETABLE_SIZE;
         }
       }
+
+      voices[v].phaseAccumulator = phase;
+      voices[v].currentVol = current;
     }
 
-    if (currentTrackID > 0 && wavFile && wavFile.available()) {
-      float gainL = (1.0f - targetPan) * VOL;
-      float gainR = targetPan * VOL;
-
-      size_t bytesRead = wavFile.read((uint8_t*)buffer, bufSize);
-      size_t samples = bytesRead / 2; // 16-bit samples
-
-      // Apply volume/panning
-      for (int i = 0; i < samples; i+=2) {
-         // Simple fade-in for first buffer to avoid clicks could go here
-         float smoothFactor = 1.0f;
-         if (firstBuffer) {
-           smoothFactor = (float)i / samples; 
-         }
-         
-         // Stereo processing: even indices are Left (usually), odd are Right
-         // Note: buffer contains interleaved 16-bit samples [L, R, L, R...]
-         if (i+1 < samples) {
-             buffer[i]   = (int16_t)((float)buffer[i]   * gainL * smoothFactor);
-             buffer[i+1] = (int16_t)((float)buffer[i+1] * gainR * smoothFactor);
-         }
-      }
-      
-      firstBuffer = false; 
-      size_t bytesWritten = 0;
-      i2s_channel_write(tx_handle, buffer, bytesRead, &bytesWritten, portMAX_DELAY);
-      
-      // Loop the track if we reach the end but target hasn't changed
-      if (bytesRead < bufSize) {
-          wavFile.seek(44); 
-      }
-    } else {
-      // Silence when no track is playing
-      memset(buffer, 0, bufSize);
-      size_t bytesWritten = 0;
-      i2s_channel_write(tx_handle, buffer, bufSize, &bytesWritten, portMAX_DELAY);
-      // Small delay to yield to other tasks
-      vTaskDelay(10 / portTICK_PERIOD_MS);
+    // Clamp to prevent overflow
+    for (int i = 0; i < (int)(numFrames * 2); i++) {
+      if (buffer[i] > 32767) buffer[i] = 32767;
+      if (buffer[i] < -32768) buffer[i] = -32768;
     }
+
+    size_t bytesWritten = 0;
+    i2s_channel_write(tx_handle, buffer, bufSize, &bytesWritten, portMAX_DELAY);
   }
 }
 
@@ -268,17 +289,27 @@ void setup() {
     pinMode(sensorPins[i], INPUT);
   }
 
-  // ---------- SD & I2S Setup ----------
-  // Initialize SPI for SD Card
+  // ---------- SD Card Setup (kept for future use) ----------
   SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SD_CS_PIN);
   if (!SD.begin(SD_CS_PIN)) {
     Serial.println("SD Init Failed!");
-    // We continue mostly so BLE can still work, but audio won't
   } else {
     Serial.println("SD Card Ready");
   }
 
-  // Initialize I2S
+  // ---------- Synthesis Setup ----------
+  generateAccordionWavetable();
+  for (int i = 0; i < NUM_VOICES; i++) {
+    voices[i].phaseAccumulator = 0.0f;
+    voices[i].phaseIncrement = (noteFreqs[i] * WAVETABLE_SIZE) / (float)SAMPLE_RATE;
+    voices[i].targetVol = 0.0f;
+    voices[i].currentVol = 0.0f;
+    // Right foot sensors (0,2) -> left speaker, Left foot sensors (1,3) -> right speaker
+    voices[i].panL = (i == 0 || i == 2) ? 1.0f : 0.0f;
+    voices[i].panR = (i == 0 || i == 2) ? 0.0f : 1.0f;
+  }
+
+  // ---------- I2S Setup ----------
   i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
   i2s_new_channel(&chan_cfg, &tx_handle, NULL);
   i2s_std_config_t std_cfg = {
@@ -295,7 +326,7 @@ void setup() {
   i2s_channel_init_std_mode(tx_handle, &std_cfg);
   
   // Start Audio Task on Core 0 (leaving Core 1 for Arduino Loop/BLE)
-  xTaskCreatePinnedToCore(audioTask, "AudioTask", 4096, NULL, 10, NULL, 0);
+  xTaskCreatePinnedToCore(audioTask, "AudioTask", 8192, NULL, 10, NULL, 0);
   Serial.println("Audio Task Started.");
 
   // ---------- BLE Init ----------
@@ -335,65 +366,36 @@ void setup() {
 }
 
 void loop() {
-  if (!systemOn) {
-    // If system is OFF, silence audio and do not process audio logic
-    if (VOL != 0.0f) VOL = 0.0f;
-    if (targetTrack != 0) targetTrack = 0;
-    
-    // We still need to handle BLE connections, so we fall through to BLE Logic
-  }
-
   // ---- Read Sensors ----
   int sensorValues[numSensors];
-  int maxForce = 0; // עכשיו אנחנו מחפשים את ה*כוח* המקסימלי (אחרי קיזוז הכיול) ולא את הערך הגולמי
-  int maxIdx = -1;
   unsigned long timestamp = millis();
 
   for (int i = 0; i < numSensors; i++) {
     sensorValues[i] = analogRead(sensorPins[i]);
-
-    // חישוב הכוח הנקי על ידי חיסור ערך הכיול מהערך הנוכחי
-    int force = sensorValues[i] - sensorBaselines[i];
-    if (force < 0) force = 0; // התעלם מלחץ נמוך יותר ממצב המנוחה
-
-    if (force > maxForce) {
-      maxForce = force;
-      maxIdx = i;
-    }
   }
 
-  // ---- Audio Logic (New Logic) ----
-  static int currentWinner = -1;
+  // ---- Polyphonic Audio Logic ----
   if (systemOn) {
-    // בדיקה אם הכוח עובר את הסף של החיישן המוביל
-    if (maxIdx >= 0 && maxForce > sensorThresholds[maxIdx]) {
+    for (int i = 0; i < numSensors; i++) {
+      int force = sensorValues[i] - sensorBaselines[i];
+      if (force < 0) force = 0;
 
-        // חישוב הכוח בטווח מנורמל (מקו הכיול ועד המקסימום האפשרי)
-        float normalizedForce = (float)maxForce / (4095.0f - sensorBaselines[maxIdx]);
-        if (normalizedForce < 0) normalizedForce = 0;
-        if (normalizedForce > 1) normalizedForce = 1;
+      if (force > sensorThresholds[i]) {
+        float maxRange = 4095.0f - sensorBaselines[i];
+        float normalizedForce = (float)force / maxRange;
+        if (normalizedForce > 1.0f) normalizedForce = 1.0f;
 
-        float scalingFactor = sensorMaxVol[maxIdx];
-
-        float baseVolume = 0.5f + (normalizedForce * 0.5f);
-        VOL = baseVolume * scalingFactor * masterVol;
-        // מניעת חריגה שגורמת לעיוות שמע
-        if (VOL > 1.0f) VOL = 1.0f;
-
-        if (maxIdx != currentWinner) {
-          currentWinner = maxIdx;
-          targetTrack = currentWinner + 1; // Tracks 1..4
-          targetPan = (currentWinner == 0 || currentWinner == 2) ? 0.0f : 1.0f;
-        }
-    } else {
-        // Signal below threshold -> silence
-        VOL = 0.0f;
+        float baseVolume = 0.3f + (normalizedForce * 0.7f);
+        voices[i].targetVol = baseVolume * sensorMaxVol[i] * masterVol;
+        if (voices[i].targetVol > 1.0f) voices[i].targetVol = 1.0f;
+      } else {
+        voices[i].targetVol = 0.0f;
+      }
     }
   } else {
-      // System is OFF
-      targetTrack = 0;
-      currentWinner = -1;
-      VOL = 0.0f;
+    for (int i = 0; i < NUM_VOICES; i++) {
+      voices[i].targetVol = 0.0f;
+    }
   }
 
   // ---- BLE Logic ----
