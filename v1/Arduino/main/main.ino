@@ -311,6 +311,9 @@ void audioTask(void *parameter) {
 
     size_t bytesWritten = 0;
     i2s_channel_write(tx_handle, buffer, bufSize, &bytesWritten, portMAX_DELAY);
+
+    // Yield to let loop() run on same core (sensors + BLE notify)
+    vTaskDelay(1);
   }
 }
 
@@ -506,8 +509,9 @@ void setup() {
   };
   i2s_channel_init_std_mode(tx_handle, &std_cfg);
   
-  // Start Audio Task on Core 0 (leaving Core 1 for Arduino Loop/BLE)
-  xTaskCreatePinnedToCore(audioTask, "AudioTask", 16384, NULL, 10, NULL, 0);
+  // Audio on Core 1 (same core as Arduino loop) — frees Core 0 for BLE stack
+  // Priority 5 > loop's 1, so audio gets CPU when needed but yields on I2S DMA block
+  xTaskCreatePinnedToCore(audioTask, "AudioTask", 16384, NULL, 5, NULL, 1);
   Serial.println("Audio Task Started.");
 
   // ---------- BLE Init ----------
