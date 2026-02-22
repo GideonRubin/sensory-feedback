@@ -496,9 +496,10 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
 // ---------- BLE Notify Task (Core 0) ----------
 // Runs on the same core as BLE stack — eliminates cross-core mutex contention.
 // loop() on Core 1 just writes blePayload + sets flag, this task does the actual notify.
+// MUST be created AFTER BLEDevice::init() to avoid conflicting with BLE controller startup.
 void bleNotifyTask(void *parameter) {
   while (true) {
-    if (bleNeedsSend && deviceConnected) {
+    if (bleNeedsSend && deviceConnected && pSensorCharacteristic != NULL) {
       pSensorCharacteristic->setValue(blePayload);
       pSensorCharacteristic->notify();
       bleNeedsSend = false;
@@ -566,10 +567,6 @@ void setup() {
   xTaskCreatePinnedToCore(audioTask, "AudioTask", 16384, NULL, 3, NULL, 1);
   Serial.println("Audio Task Started.");
 
-  // BLE notify on Core 0 (same core as BLE stack) — prevents cross-core mutex deadlock
-  xTaskCreatePinnedToCore(bleNotifyTask, "BLENotify", 2048, NULL, 2, NULL, 0);
-  Serial.println("BLE Notify Task Started.");
-
   // ---------- BLE Init ----------
   BLEDevice::init("ESP32");
   pServer = BLEDevice::createServer();
@@ -604,6 +601,11 @@ void setup() {
   pAdvertising->setMinPreferred(0x0);  
   BLEDevice::startAdvertising();
   Serial.println("Waiting a client connection to notify...");
+
+  // BLE notify on Core 0 (same core as BLE stack) — AFTER BLE init to avoid conflicts
+  // Stack 4096: setValue + notify do internal heap allocations
+  xTaskCreatePinnedToCore(bleNotifyTask, "BLENotify", 4096, NULL, 2, NULL, 0);
+  Serial.println("BLE Notify Task Started.");
 }
 
 void loop() {
