@@ -21,6 +21,16 @@ export function Home() {
   const prevConnected = useRef(false)
   const prevReconnecting = useRef(false)
 
+  // Refs that always hold the latest state — immune to stale closures
+  const audioModeRef = useRef<AudioMode>(audioMode)
+  const volumeRef = useRef(volume)
+  const sensitivityRef = useRef(sensitivity)
+  const ledStateRef = useRef(ledState)
+  useEffect(() => { audioModeRef.current = audioMode }, [audioMode])
+  useEffect(() => { volumeRef.current = volume }, [volume])
+  useEffect(() => { sensitivityRef.current = sensitivity }, [sensitivity])
+  useEffect(() => { ledStateRef.current = ledState }, [ledState])
+
   useEffect(() => {
     if (notification) {
       const timer = setTimeout(() => setNotification(null), 3000);
@@ -54,14 +64,20 @@ export function Home() {
   const syncStateToDevice = async () => {
     // Small delay to let BLE connection stabilize
     await new Promise(resolve => setTimeout(resolve, 300));
+    // Read from refs (not state) to avoid stale closure values
+    const mode = audioModeRef.current;
+    const vol = volumeRef.current[0];
+    const sens = sensitivityRef.current[0];
+    const power = ledStateRef.current;
+    console.log(`[SYNC] mode=${mode} vol=${vol} sens=${sens} power=${power}`);
     try {
-      await EspApi.setMode(audioMode);
-      EspApi.setVolumeTotal(volume[0]);
+      await EspApi.setMode(mode);
+      EspApi.setVolumeTotal(vol);
       for (let i = 0; i < 4; i++) {
-        EspApi.setSensorVolume(i, volume[0]);
+        EspApi.setSensorVolume(i, vol);
       }
-      await EspApi.switchOn(ledState);
-      EspApi.setSensitivity(sensitivity[0]);
+      await EspApi.switchOn(power);
+      EspApi.setSensitivity(sens);
     } catch (error) {
       console.error('Failed to sync state:', error);
     }
