@@ -3,7 +3,8 @@ import { EspApi } from '../services/api'
 import { useConnection } from '@/context/ConnectionContext'
 import { Switch } from '@/components/ui/switch'
 import { Slider } from '@/components/ui/slider'
-import { Power, Volume2, XCircle, CheckCircle2 } from 'lucide-react'
+import { Power, Volume2, XCircle, CheckCircle2, Music, AudioWaveform } from 'lucide-react'
+import type { AudioMode } from '../services/api'
 
 interface Notification {
   message: string;
@@ -14,6 +15,7 @@ export function Home() {
   const { isConnected, connect, disconnect } = useConnection()
   const [ledState, setLedState] = useState(true)
   const [volume, setVolume] = useState([100]) // Default volume 100
+  const [audioMode, setAudioMode] = useState<AudioMode>(0)
   const [notification, setNotification] = useState<Notification | null>(null)
   // const [batteryLevel, setBatteryLevel] = useState<number | null>(null)
 
@@ -90,10 +92,16 @@ export function Home() {
     const newVol = value[0];
     setVolume(value);
     if (!isConnected) return;
-    // Set volume for all 4 sensors
+    EspApi.setVolumeTotal(newVol);
     for(let i=0; i<4; i++) {
       EspApi.setSensorVolume(i, newVol);
     }
+  }
+
+  const handleModeChange = (mode: AudioMode) => {
+    setAudioMode(mode);
+    if (!isConnected) return;
+    EspApi.setMode(mode);
   }
 
   /* const getBatteryIcon = (level: number) => {
@@ -152,6 +160,34 @@ export function Home() {
                 >
                   <Speaker className="w-10 h-10" strokeWidth={1.5} />
                 </button> */}
+              </div>
+
+              {/* Mode Selector */}
+              <div className="w-full px-2 animate-in slide-in-from-bottom-4 duration-700 delay-75 fill-mode-both">
+                <div className="flex bg-slate-100 rounded-2xl p-1">
+                  <button
+                    onClick={() => handleModeChange(0)}
+                    className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-xl text-sm font-medium transition-all duration-200 ${
+                      audioMode === 0
+                        ? 'bg-white text-slate-800 shadow-sm'
+                        : 'text-slate-400 hover:text-slate-500'
+                    }`}
+                  >
+                    <AudioWaveform className="w-4 h-4" />
+                    Accordion
+                  </button>
+                  <button
+                    onClick={() => handleModeChange(1)}
+                    className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-xl text-sm font-medium transition-all duration-200 ${
+                      audioMode === 1
+                        ? 'bg-white text-slate-800 shadow-sm'
+                        : 'text-slate-400 hover:text-slate-500'
+                    }`}
+                  >
+                    <Music className="w-4 h-4" />
+                    Song
+                  </button>
+                </div>
               </div>
 
               {/* Volume Slider Card */}

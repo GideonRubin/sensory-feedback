@@ -42,6 +42,31 @@ struct Voice {
 
 Voice voices[NUM_VOICES];
 
+// ---------- Audio Mode ----------
+volatile int audioMode = 0;  // 0 = accordion, 1 = song + enrichment
+
+// Mode 1: Song playback from SD card
+File songFile;
+bool songFileOpen = false;
+#define WAV_HEADER_SIZE 44
+
+// Mode 1: Shared circular delay buffer for BOTH effects
+// Long enough for the longest delay (250ms = 5512 frames)
+#define DELAY_BUF_FRAMES 5512
+int16_t delayBuffer[DELAY_BUF_FRAMES * 2];  // stereo circular buffer
+int delayWritePos = 0;
+
+// Front sensors: Chorus thickening (short delay ~25ms = 551 frames)
+#define CHORUS_DELAY_FRAMES 551
+volatile float chorusWet = 0.0f;     // 0.0=none, up to 0.35
+
+// Back sensors: Rhythmic echo bounce (long delay ~250ms = 5512 frames)
+#define ECHO_DELAY_FRAMES 5512
+volatile float echoWet = 0.0f;       // 0.0=none, up to 0.40
+
+// Song volume controlled by front sensors
+volatile float songVolScale = 0.4f;  // 0.4 baseline, up to 1.0 with sensor press
+
 #define I2S_BCLK_PIN  GPIO_NUM_27
 #define I2S_WS_PIN    GPIO_NUM_14
 #define I2S_DOUT_PIN  GPIO_NUM_22
@@ -98,14 +123,40 @@ void generateAccordionWavetable() {
   Serial.println("Accordion wavetable generated.");
 }
 
-// ---------- Audio Task (Synthesis) ----------
+// ---------- Delay Buffer Init ----------
+void initDelayBuffer() {
+  memset(delayBuffer, 0, sizeof(delayBuffer));
+  delayWritePos = 0;
+  chorusWet = 0.0f;
+  echoWet = 0.0f;
+  Serial.println("Delay buffer initialized (chorus 25ms + echo 250ms).");
+}
+
+// ---------- Song File Helper ----------
+void openSongFile() {
+  if (songFileOpen) {
+    songFile.close();
+    songFileOpen = false;
+  }
+  songFile = SD.open("/SONG.WAV");
+  if (songFile) {
+    songFile.seek(WAV_HEADER_SIZE);
+    songFileOpen = true;
+    Serial.println("SONG.WAV opened");
+  } else {
+    Serial.println("SONG.WAV not found on SD card!");
+  }
+}
+
+// ---------- Audio Task (Dual Mode) ----------
 void audioTask(void *parameter) {
   const size_t numFrames = 256;
   const size_t bufSize = numFrames * 2 * sizeof(int16_t); // stereo 16-bit
   int16_t *buffer = (int16_t *)heap_caps_malloc(bufSize, MALLOC_CAP_DMA);
+  int16_t *songBuf = (int16_t *)heap_caps_malloc(bufSize, MALLOC_CAP_DMA);
 
-  if (buffer == NULL) {
-    Serial.println("Failed to allocate audio buffer");
+  if (buffer == NULL || songBuf == NULL) {
+    Serial.println("Failed to allocate audio buffers");
     vTaskDelete(NULL);
     return;
   }
@@ -118,45 +169,97 @@ void audioTask(void *parameter) {
   while (true) {
     memset(buffer, 0, bufSize);
 
-    for (int v = 0; v < NUM_VOICES; v++) {
-      float phase = voices[v].phaseAccumulator;
-      float phaseInc = voices[v].phaseIncrement;
-      float target = voices[v].targetVol;
-      float current = voices[v].currentVol;
-      float panL = voices[v].panL;
-      float panR = voices[v].panR;
+    int currentMode = audioMode;
 
-      for (int f = 0; f < (int)numFrames; f++) {
-        // Per-sample volume smoothing
-        float alpha = (target > current) ? attackAlpha : releaseAlpha;
-        current += alpha * (target - current);
-
-        // Wavetable lookup with linear interpolation
-        int idx0 = (int)phase;
-        int idx1 = (idx0 + 1) & (WAVETABLE_SIZE - 1);
-        float frac = phase - (float)idx0;
-        idx0 &= (WAVETABLE_SIZE - 1);
-
-        float sample = (float)wavetable[idx0] + frac * (float)(wavetable[idx1] - wavetable[idx0]);
-        float out = sample * current;
-
-        // Mix into stereo buffer
-        int bufIdx = f * 2;
-        buffer[bufIdx]     += (int16_t)(out * panL);
-        buffer[bufIdx + 1] += (int16_t)(out * panR);
-
-        // Advance phase
-        phase += phaseInc;
-        if (phase >= (float)WAVETABLE_SIZE) {
-          phase -= (float)WAVETABLE_SIZE;
+    // ---- Mode 1: Song + Echo/Doubling + Tremolo (song manipulation) ----
+    if (currentMode == 1 && songFileOpen) {
+      size_t bytesRead = songFile.read((uint8_t*)songBuf, bufSize);
+      if (bytesRead < bufSize) {
+        songFile.seek(WAV_HEADER_SIZE);
+        if (bufSize - bytesRead > 0) {
+          songFile.read((uint8_t*)songBuf + bytesRead, bufSize - bytesRead);
         }
       }
 
-      voices[v].phaseAccumulator = phase;
-      voices[v].currentVol = current;
+      float sv = songVolScale * masterVol;
+      float chWet = chorusWet;
+      float ecWet = echoWet;
+
+      for (int f = 0; f < (int)numFrames; f++) {
+        int idx = f * 2;
+
+        // Current song samples (volume-scaled)
+        float outL = (float)songBuf[idx] * sv;
+        float outR = (float)songBuf[idx + 1] * sv;
+
+        // --- Read from BOTH delay positions (additive enrichment only!) ---
+        // Chorus: read from 25ms ago → thickens the sound
+        int chorusReadPos = (delayWritePos - CHORUS_DELAY_FRAMES + DELAY_BUF_FRAMES) % DELAY_BUF_FRAMES;
+        float chorusL = (float)delayBuffer[chorusReadPos * 2] * sv;
+        float chorusR = (float)delayBuffer[chorusReadPos * 2 + 1] * sv;
+
+        // Echo: read from 250ms ago → adds rhythmic bounce
+        int echoReadPos = (delayWritePos - ECHO_DELAY_FRAMES + DELAY_BUF_FRAMES) % DELAY_BUF_FRAMES;
+        float echoL = (float)delayBuffer[echoReadPos * 2] * sv;
+        float echoR = (float)delayBuffer[echoReadPos * 2 + 1] * sv;
+
+        // Write current RAW song samples into delay buffer
+        delayBuffer[delayWritePos * 2]     = songBuf[idx];
+        delayBuffer[delayWritePos * 2 + 1] = songBuf[idx + 1];
+        delayWritePos = (delayWritePos + 1) % DELAY_BUF_FRAMES;
+
+        // ADD effects to the song (never subtract!)
+        outL += chorusL * chWet;  // front: chorus thickening
+        outR += chorusR * chWet;
+        outL += echoL * ecWet;    // back: rhythmic echo bounce
+        outR += echoR * ecWet;
+
+        // Clamp output
+        int32_t iL = (int32_t)outL;
+        int32_t iR = (int32_t)outR;
+        buffer[idx]     = (int16_t)(iL > 32767 ? 32767 : (iL < -32768 ? -32768 : iL));
+        buffer[idx + 1] = (int16_t)(iR > 32767 ? 32767 : (iR < -32768 ? -32768 : iR));
+      }
     }
 
-    // Clamp to prevent overflow
+    // ---- Mode 0: Accordion wavetable synthesis (all 4 voices) ----
+    if (currentMode == 0) {
+      for (int v = 0; v < NUM_VOICES; v++) {
+        float phase = voices[v].phaseAccumulator;
+        float phaseInc = voices[v].phaseIncrement;
+        float target = voices[v].targetVol;
+        float current = voices[v].currentVol;
+        float panL = voices[v].panL;
+        float panR = voices[v].panR;
+
+        for (int f = 0; f < (int)numFrames; f++) {
+          float alpha = (target > current) ? attackAlpha : releaseAlpha;
+          current += alpha * (target - current);
+
+          int idx0 = (int)phase;
+          int idx1 = (idx0 + 1) & (WAVETABLE_SIZE - 1);
+          float frac = phase - (float)idx0;
+          idx0 &= (WAVETABLE_SIZE - 1);
+
+          float sample = (float)wavetable[idx0] + frac * (float)(wavetable[idx1] - wavetable[idx0]);
+          float out = sample * current;
+
+          int bufIdx = f * 2;
+          buffer[bufIdx]     += (int16_t)(out * panL);
+          buffer[bufIdx + 1] += (int16_t)(out * panR);
+
+          phase += phaseInc;
+          if (phase >= (float)WAVETABLE_SIZE) {
+            phase -= (float)WAVETABLE_SIZE;
+          }
+        }
+
+        voices[v].phaseAccumulator = phase;
+        voices[v].currentVol = current;
+      }
+    }
+
+    // Clamp to prevent overflow (Mode 0 accumulates, Mode 1 already clamped inline)
     for (int i = 0; i < (int)(numFrames * 2); i++) {
       if (buffer[i] > 32767) buffer[i] = 32767;
       if (buffer[i] < -32768) buffer[i] = -32768;
@@ -276,6 +379,32 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
       masterVol = vol / 100.0f;
       Serial.printf("Master Volume: %f\n", masterVol);
     }
+    else if (command == "MODE") {
+      int mode = data.toInt();
+      if (mode == 0) {
+        audioMode = 0;
+        if (songFileOpen) { songFile.close(); songFileOpen = false; }
+        // Restore accordion frequencies
+        for (int i = 0; i < NUM_VOICES; i++) {
+          voices[i].phaseIncrement = (noteFreqs[i] * WAVETABLE_SIZE) / (float)SAMPLE_RATE;
+          voices[i].targetVol = 0.0f;
+        }
+        Serial.println("Mode: Accordion");
+      } else if (mode == 1) {
+        // Song mode: silence all accordion voices
+        for (int i = 0; i < NUM_VOICES; i++) {
+          voices[i].targetVol = 0.0f;
+        }
+        // Reset song manipulation effects
+        chorusWet = 0.0f;
+        echoWet = 0.0f;
+        initDelayBuffer();
+        songVolScale = 0.4f;
+        openSongFile();
+        audioMode = 1;
+        Serial.println("Mode: Song + Echo/Tremolo manipulation");
+      }
+    }
   }
 };
 
@@ -299,6 +428,7 @@ void setup() {
 
   // ---------- Synthesis Setup ----------
   generateAccordionWavetable();
+  initDelayBuffer();
   for (int i = 0; i < NUM_VOICES; i++) {
     voices[i].phaseAccumulator = 0.0f;
     voices[i].phaseIncrement = (noteFreqs[i] * WAVETABLE_SIZE) / (float)SAMPLE_RATE;
@@ -326,7 +456,7 @@ void setup() {
   i2s_channel_init_std_mode(tx_handle, &std_cfg);
   
   // Start Audio Task on Core 0 (leaving Core 1 for Arduino Loop/BLE)
-  xTaskCreatePinnedToCore(audioTask, "AudioTask", 8192, NULL, 10, NULL, 0);
+  xTaskCreatePinnedToCore(audioTask, "AudioTask", 12288, NULL, 10, NULL, 0);
   Serial.println("Audio Task Started.");
 
   // ---------- BLE Init ----------
@@ -374,28 +504,78 @@ void loop() {
     sensorValues[i] = analogRead(sensorPins[i]);
   }
 
-  // ---- Polyphonic Audio Logic ----
+  // ---- Audio Logic (mode-dependent) ----
   if (systemOn) {
-    for (int i = 0; i < numSensors; i++) {
-      int force = sensorValues[i] - sensorBaselines[i];
-      if (force < 0) force = 0;
+    int currentMode = audioMode;
 
-      if (force > sensorThresholds[i]) {
-        float maxRange = 4095.0f - sensorBaselines[i];
-        float normalizedForce = (float)force / maxRange;
-        if (normalizedForce > 1.0f) normalizedForce = 1.0f;
+    if (currentMode == 0) {
+      // Mode 0: Accordion - all 4 voices play C Major
+      for (int i = 0; i < numSensors; i++) {
+        int force = sensorValues[i] - sensorBaselines[i];
+        if (force < 0) force = 0;
 
-        float baseVolume = 0.3f + (normalizedForce * 0.7f);
-        voices[i].targetVol = baseVolume * sensorMaxVol[i] * masterVol;
-        if (voices[i].targetVol > 1.0f) voices[i].targetVol = 1.0f;
-      } else {
-        voices[i].targetVol = 0.0f;
+        if (force > sensorThresholds[i]) {
+          float maxRange = 4095.0f - sensorBaselines[i];
+          float normalizedForce = (float)force / maxRange;
+          if (normalizedForce > 1.0f) normalizedForce = 1.0f;
+
+          float baseVolume = 0.3f + (normalizedForce * 0.7f);
+          voices[i].targetVol = baseVolume * sensorMaxVol[i] * masterVol;
+          if (voices[i].targetVol > 1.0f) voices[i].targetVol = 1.0f;
+        } else {
+          voices[i].targetVol = 0.0f;
+        }
       }
+    } else {
+      // Mode 1: Song manipulation (echo/doubling + tremolo)
+      // Front sensors (0,1): control echo wet mix + song volume boost
+      float frontForceSum = 0.0f;
+      int frontActive = 0;
+
+      for (int i = 0; i < 2; i++) {
+        int force = sensorValues[i] - sensorBaselines[i];
+        if (force < 0) force = 0;
+
+        if (force > sensorThresholds[i]) {
+          float maxRange = 4095.0f - sensorBaselines[i];
+          float normalizedForce = (float)force / maxRange;
+          if (normalizedForce > 1.0f) normalizedForce = 1.0f;
+          frontForceSum += normalizedForce;
+          frontActive++;
+        }
+      }
+
+      // Front sensors → chorus thickening + volume swell (ADDITIVE enrichment)
+      if (frontActive > 0) {
+        float avgForce = frontForceSum / (float)frontActive;
+        chorusWet = avgForce * 0.35f;            // up to 35% chorus → thicker sound
+        songVolScale = 0.4f + avgForce * 0.6f;   // 40-100% volume (wider range)
+      } else {
+        chorusWet = 0.0f;
+        songVolScale = 0.4f;
+      }
+
+      // Back sensors (2,3): control rhythmic echo bounce (ADDITIVE enrichment)
+      float backForceMax = 0.0f;
+      for (int i = 2; i < 4; i++) {
+        int force = sensorValues[i] - sensorBaselines[i];
+        if (force < 0) force = 0;
+
+        if (force > sensorThresholds[i]) {
+          float maxRange = 4095.0f - sensorBaselines[i];
+          float normalizedForce = (float)force / maxRange;
+          if (normalizedForce > 1.0f) normalizedForce = 1.0f;
+          if (normalizedForce > backForceMax) backForceMax = normalizedForce;
+        }
+      }
+      // Back sensors → echo bounce: adds a musical repeat of the song
+      echoWet = backForceMax * 0.40f;  // up to 40% echo → rhythmic bounce
     }
   } else {
     for (int i = 0; i < NUM_VOICES; i++) {
       voices[i].targetVol = 0.0f;
     }
+    songVolScale = 0.4f;
   }
 
   // ---- BLE Logic ----

@@ -14,12 +14,15 @@ export interface Sensor {
 
 export type Sensors = Sensor[];
 
+export type AudioMode = 0 | 1;  // 0 = accordion, 1 = song + feedback
+
 export const BleEndpoints = {
   LED: 'LED',
   PING: 'PING',
   VOLUME_TOTAL: 'VOLUME_TOTAL',
   SENSOR_THRESHOLD: 'SENSOR_THRESHOLD',
   SENSOR_VOLUME: 'SENSOR_VOLUME',
+  MODE: 'MODE',
 } as const;
 
 // Helper class for simulation state
@@ -165,6 +168,9 @@ export const EspApi = {
   },
   setVolumeTotal: (volume: number): void => {
     EspApi.write(BleEndpoints.VOLUME_TOTAL, `${volume}`);
+  },
+  setMode: (mode: AudioMode): void => {
+    EspApi.write(BleEndpoints.MODE, `${mode}`);
   },
   getVolume: (): number => {
     // TODO: Implement communication with ESP32
