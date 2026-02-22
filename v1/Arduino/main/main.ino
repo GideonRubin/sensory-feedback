@@ -704,6 +704,7 @@ void loop() {
   // BLE Maintenance
   if (!deviceConnected && oldDeviceConnected) {
     Serial.println("Device disconnected.");
+    bleNeedsSend = false;  // clear flag so loop can write fresh data on reconnect
     delay(500);
     pServer->startAdvertising();
     Serial.println("Start advertising");
