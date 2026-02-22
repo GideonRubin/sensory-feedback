@@ -17,6 +17,12 @@ volatile int sensorThresholds[4] = {150, 150, 150, 150};
 volatile float masterVol = 1.0f;
 volatile bool systemOn = true;
 
+// Sensitivity curve exponents (controlled via BLE slider 0-100)
+// Front uses lower exponent = more sensitive to light touch
+// Back uses higher exponent = needs harder press
+volatile float frontExp = 0.5f;   // default: sqrt (very responsive)
+volatile float backExp  = 2.0f;   // default: squared (needs firm press)
+
 // ---------- Wavetable Synthesis ----------
 #define WAVETABLE_SIZE 256
 #define NUM_VOICES 4
@@ -452,6 +458,17 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
         Serial.println("Mode: Song + Frequency Filter (walk to restore)");
       }
     }
+    else if (command == "SENSITIVITY") {
+      // Slider 0-100: 0=back sensitive, 50=balanced, 100=front sensitive
+      float s = data.toFloat();
+      if (s < 0) s = 0;
+      if (s > 100) s = 100;
+      float t = s / 100.0f;
+      // Map slider to exponents: higher exponent = less sensitive
+      frontExp = 2.0f - t * 1.7f;   // 2.0 at s=0 → 0.3 at s=100
+      backExp  = 0.3f + t * 1.7f;   // 0.3 at s=0 → 2.0 at s=100
+      Serial.printf("Sensitivity: slider=%d front=%.2f back=%.2f\n", (int)s, frontExp, backExp);
+    }
   }
 };
 
@@ -574,13 +591,9 @@ void loop() {
           float normalizedForce = (float)force / maxRange;
           if (normalizedForce > 1.0f) normalizedForce = 1.0f;
 
-          // Front sensors (0,1): sqrt curve — very sensitive to light touch
-          // Back sensors (2,3): squared curve — needs firmer press
-          if (i < 2) {
-            normalizedForce = sqrtf(normalizedForce);
-          } else {
-            normalizedForce = normalizedForce * normalizedForce;
-          }
+          // Sensitivity curve: front (low exponent = responsive), back (high = firm)
+          float exp = (i < 2) ? frontExp : backExp;
+          normalizedForce = powf(normalizedForce, exp);
 
           float baseVolume = 0.3f + (normalizedForce * 0.7f);
           voices[i].targetVol = baseVolume * sensorMaxVol[i] * masterVol;
@@ -596,16 +609,15 @@ void loop() {
 
       // Helper: update a band level with hold+decay logic
       // Returns the new output level
-      // CURVE param: expression applied to nf after normalization
-      // Front = sqrtf(nf) → very responsive, Back = (nf*nf) → needs firm press
-      #define UPDATE_BAND(sensorIdx, baseVal, hold, outVar, CURVE) do { \
+      // sensExp: sensitivity exponent (front=low → responsive, back=high → firm)
+      #define UPDATE_BAND(sensorIdx, baseVal, hold, outVar, sensExp) do { \
         int force = sensorValues[sensorIdx] - sensorBaselines[sensorIdx]; \
         if (force < 0) force = 0; \
         if (force > sensorThresholds[sensorIdx]) { \
           float maxRange = 4095.0f - sensorBaselines[sensorIdx]; \
           float nf = (float)force / maxRange; \
           if (nf > 1.0f) nf = 1.0f; \
-          nf = CURVE; \
+          nf = powf(nf, sensExp); \
           float level = baseVal + nf * (1.0f - baseVal); \
           hold.peak = level; \
           hold.lastActive = now; \
@@ -623,12 +635,14 @@ void loop() {
         } \
       } while(0)
 
-      // Front sensors: sqrt curve — light touch gives strong response
-      UPDATE_BAND(0, TREBLE_BASE, holdTrebleR, trebleLvlR, sqrtf(nf));
-      UPDATE_BAND(1, TREBLE_BASE, holdTrebleL, trebleLvlL, sqrtf(nf));
-      // Back sensors: squared curve — needs firmer press
-      UPDATE_BAND(2, BASS_BASE, holdBassR, bassLvlR, (nf * nf));
-      UPDATE_BAND(3, BASS_BASE, holdBassL, bassLvlL, (nf * nf));
+      float fExp = frontExp;  // read volatile once
+      float bExp = backExp;
+      // Front sensors: dynamic sensitivity curve
+      UPDATE_BAND(0, TREBLE_BASE, holdTrebleR, trebleLvlR, fExp);
+      UPDATE_BAND(1, TREBLE_BASE, holdTrebleL, trebleLvlL, fExp);
+      // Back sensors: dynamic sensitivity curve
+      UPDATE_BAND(2, BASS_BASE, holdBassR, bassLvlR, bExp);
+      UPDATE_BAND(3, BASS_BASE, holdBassL, bassLvlL, bExp);
     }
   } else {
     for (int i = 0; i < NUM_VOICES; i++) {

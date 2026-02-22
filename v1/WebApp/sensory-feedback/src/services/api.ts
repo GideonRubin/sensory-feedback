@@ -23,6 +23,7 @@ export const BleEndpoints = {
   SENSOR_THRESHOLD: 'SENSOR_THRESHOLD',
   SENSOR_VOLUME: 'SENSOR_VOLUME',
   MODE: 'MODE',
+  SENSITIVITY: 'SENSITIVITY',
 } as const;
 
 // Helper class for simulation state
@@ -171,6 +172,10 @@ export const EspApi = {
   },
   setMode: (mode: AudioMode): void => {
     EspApi.write(BleEndpoints.MODE, `${mode}`);
+  },
+  // Sensitivity slider: 0=back sensitive, 50=balanced, 100=front sensitive
+  setSensitivity: (value: number): void => {
+    EspApi.write(BleEndpoints.SENSITIVITY, `${value}`);
   },
   getVolume: (): number => {
     // TODO: Implement communication with ESP32

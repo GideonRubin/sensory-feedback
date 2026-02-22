@@ -3,7 +3,7 @@ import { EspApi } from '../services/api'
 import { useConnection } from '@/context/ConnectionContext'
 import { Switch } from '@/components/ui/switch'
 import { Slider } from '@/components/ui/slider'
-import { Power, Volume2, XCircle, CheckCircle2, Music, AudioWaveform } from 'lucide-react'
+import { Power, Volume2, XCircle, CheckCircle2, Music, AudioWaveform, Footprints } from 'lucide-react'
 import type { AudioMode } from '../services/api'
 
 interface Notification {
@@ -16,6 +16,7 @@ export function Home() {
   const [ledState, setLedState] = useState(true)
   const [volume, setVolume] = useState([100]) // Default volume 100
   const [audioMode, setAudioMode] = useState<AudioMode>(0)
+  const [sensitivity, setSensitivity] = useState([75]) // 0=back, 50=balanced, 100=front
   const [notification, setNotification] = useState<Notification | null>(null)
   // const [batteryLevel, setBatteryLevel] = useState<number | null>(null)
 
@@ -65,6 +66,7 @@ export function Home() {
         EspApi.setSensorVolume(i, volume[0]);
       }
       await EspApi.switchOn(ledState);
+      EspApi.setSensitivity(sensitivity[0]);
     } catch (error) {
       console.error('Failed to sync state:', error);
     }
@@ -119,6 +121,12 @@ export function Home() {
     setAudioMode(mode);
     if (!isConnected) return;
     EspApi.setMode(mode);
+  }
+
+  const handleSensitivityChange = (value: number[]) => {
+    setSensitivity(value);
+    if (!isConnected) return;
+    EspApi.setSensitivity(value[0]);
   }
 
   /* const getBatteryIcon = (level: number) => {
@@ -210,14 +218,32 @@ export function Home() {
               {/* Volume Slider Card */}
               <div className="w-full px-6 py-5 bg-white rounded-3xl border border-slate-100 shadow-xl shadow-slate-100/60 flex items-center gap-4 animate-in slide-in-from-bottom-4 duration-700 delay-100 fill-mode-both">
                 <Volume2 className="w-5 h-5 text-slate-400" />
-                <Slider 
+                <Slider
                   className="flex-1"
-                  value={volume} 
-                  max={100} 
-                  step={1} 
-                  onValueChange={handleVolumeChange} 
+                  value={volume}
+                  max={100}
+                  step={1}
+                  onValueChange={handleVolumeChange}
                 />
                 <span className="text-sm font-medium text-slate-400 w-8 text-right tabular-nums">{volume[0]}</span>
+              </div>
+
+              {/* Sensitivity Slider Card */}
+              <div className="w-full px-6 py-5 bg-white rounded-3xl border border-slate-100 shadow-xl shadow-slate-100/60 flex flex-col gap-3 animate-in slide-in-from-bottom-4 duration-700 delay-150 fill-mode-both">
+                <div className="flex items-center gap-4">
+                  <Footprints className="w-5 h-5 text-slate-400" />
+                  <Slider
+                    className="flex-1"
+                    value={sensitivity}
+                    max={100}
+                    step={1}
+                    onValueChange={handleSensitivityChange}
+                  />
+                </div>
+                <div className="flex justify-between text-[10px] font-medium text-slate-300 px-1">
+                  <span>Back</span>
+                  <span>Front</span>
+                </div>
               </div>
             </>
         )}
