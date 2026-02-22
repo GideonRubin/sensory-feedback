@@ -19,6 +19,7 @@ export function Home() {
   const [sensitivity, setSensitivity] = useState([75]) // 0=back, 50=balanced, 100=front
   const [notification, setNotification] = useState<Notification | null>(null)
   const prevConnected = useRef(false)
+  const prevReconnecting = useRef(false)
 
   useEffect(() => {
     if (notification) {
@@ -27,18 +28,24 @@ export function Home() {
     }
   }, [notification]);
 
-  // Re-sync state to ESP32 when connection is restored (after auto-reconnect)
+  // Re-sync state to ESP32 on first connect (user toggled on)
   useEffect(() => {
     if (isConnected && !prevConnected.current) {
-      // Just reconnected — sync all UI state including mode
       syncStateToDevice();
     }
     prevConnected.current = isConnected;
   }, [isConnected]);
 
-  // Mode persists across unexpected disconnects (e.g. BLE range loss).
-  // On reconnect, syncStateToDevice() re-sends the current mode.
-  // Only manual disconnect (toggle off) resets to accordion — see handleConnectionToggle.
+  // Re-sync state to ESP32 after auto-reconnect completes
+  // (isConnected stays true during reconnect, so we watch isReconnecting instead)
+  useEffect(() => {
+    if (!isReconnecting && prevReconnecting.current && isConnected) {
+      // Reconnect just finished successfully — re-send mode, volume, etc.
+      syncStateToDevice();
+      showNotification('Reconnected', 'success');
+    }
+    prevReconnecting.current = isReconnecting;
+  }, [isReconnecting, isConnected]);
 
   const showNotification = (message: string, type: 'success' | 'error') => {
     setNotification({ message, type });
