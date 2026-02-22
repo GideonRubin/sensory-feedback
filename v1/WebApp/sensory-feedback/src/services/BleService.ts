@@ -6,6 +6,7 @@ export const SENSOR_CHARACTERISTIC_UUID = "19b10001-e8f2-537e-4f6c-d104768a1214"
 export const COMMAND_CHARACTERISTIC_UUID = "19b10002-e8f2-537e-4f6c-d104768a1214";
 
 type SensorCallback = (value: string) => void;
+type DisconnectCallback = () => void;
 
 interface IBleService {
   connect(): Promise<void>;
@@ -15,6 +16,7 @@ interface IBleService {
   read(): Promise<Uint8Array>;
   subscribeToSensor(callback: SensorCallback): void;
   unsubscribeFromSensor(callback: SensorCallback): void;
+  onDisconnect(callback: DisconnectCallback): void;
 }
 
 class BleService implements IBleService {
@@ -23,10 +25,12 @@ class BleService implements IBleService {
   private sensorCharacteristic: BluetoothRemoteGATTCharacteristic | null = null;
   private commandCharacteristic: BluetoothRemoteGATTCharacteristic | null = null;
   private sensorCallbacks: SensorCallback[] = [];
+  private disconnectCallbacks: DisconnectCallback[] = [];
+  private writeQueue: Promise<void> = Promise.resolve(); // Serialize BLE writes
 
   constructor() {
     this.handleSensorChanged = this.handleSensorChanged.bind(this);
-    this.onDisconnected = this.onDisconnected.bind(this);
+    this.handleDisconnected = this.handleDisconnected.bind(this);
   }
 
   async connect(): Promise<void> {
@@ -41,7 +45,7 @@ class BleService implements IBleService {
         optionalServices: [SERVICE_UUID]
       });
 
-      this.device.addEventListener('gattserverdisconnected', this.onDisconnected);
+      this.device.addEventListener('gattserverdisconnected', this.handleDisconnected);
 
       console.log('Connecting to GATT Server...');
       this.server = await this.device.gatt!.connect();
@@ -75,11 +79,26 @@ class BleService implements IBleService {
   }
 
   async write(data: Uint8Array): Promise<void> {
-    if (!this.commandCharacteristic) {
-      console.warn('Command Characteristic not found');
+    if (!this.commandCharacteristic || !this.isConnected()) {
+      console.warn('Not connected or characteristic not found');
       return;
     }
-    await this.commandCharacteristic.writeValue(new Uint8Array(data));
+    // Queue writes to prevent "GATT operation already in progress" errors
+    const doWrite = async () => {
+      if (!this.commandCharacteristic || !this.isConnected()) return;
+      // Timeout to prevent stuck writes from blocking the queue
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('BLE write timeout')), 3000)
+      );
+      await Promise.race([
+        this.commandCharacteristic.writeValueWithoutResponse(new Uint8Array(data)),
+        timeout
+      ]);
+    };
+    this.writeQueue = this.writeQueue.then(doWrite).catch(err => {
+      console.warn('BLE write failed:', err.message);
+    });
+    return this.writeQueue;
   }
   
   async read(): Promise<Uint8Array> {
@@ -110,15 +129,20 @@ class BleService implements IBleService {
     }
   }
 
-  private onDisconnected(_event: Event): void {
+  onDisconnect(callback: DisconnectCallback): void {
+    this.disconnectCallbacks.push(callback);
+  }
+
+  private handleDisconnected(_event: Event): void {
     console.log('Device disconnected');
-    // Notify listeners if needed, or handle auto-reconnect
+    this.disconnectCallbacks.forEach(cb => cb());
   }
 }
 
 class BleStubService implements IBleService {
   private connected = false;
   private sensorCallbacks: SensorCallback[] = [];
+  private disconnectCallbacks: DisconnectCallback[] = [];
   private intervalId: any = null;
 
   async connect(): Promise<void> {
@@ -164,6 +188,10 @@ class BleStubService implements IBleService {
 
   unsubscribeFromSensor(callback: SensorCallback): void {
     this.sensorCallbacks = this.sensorCallbacks.filter(cb => cb !== callback);
+  }
+
+  onDisconnect(callback: DisconnectCallback): void {
+    this.disconnectCallbacks.push(callback);
   }
 
   private startSimulatingData() {

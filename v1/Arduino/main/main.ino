@@ -16,6 +16,9 @@ volatile float VOL = 1.0f;
 // Store max volume per sensor (0.0 to 100.0 from app -> normalized 0.0 to 1.0 or similar)
 // User wants 100 as max, 0 as min. We'll store as float 0.0-1.0 for calculation.
 volatile float sensorMaxVol[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+volatile int sensorBaselines[4] = {300, 300, 300, 300}; // ערכי ברירת מחדל עד לכיול הראשון
+volatile int sensorThresholds[4] = {20, 20, 20, 20};   // סף הפעלה לכל חיישן (ביח' ADC)
+volatile float masterVol = 1.0f;                        // עוצמת שמע כללית (0.0-1.0)
 volatile bool systemOn = true; // Default to TRUE (On) as per user request (switched off only via button)
 
 #define I2S_BCLK_PIN  GPIO_NUM_27
@@ -182,31 +185,75 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
     String command = cmdStr.substring(0, separatorIndex);
     String data = cmdStr.substring(separatorIndex + 1);
 
-    if (command == "SENSOR_VOLUME") {
+    if (command == "POWER") {
+      // פורמט: "POWER:1" (הפעלה) או "POWER:0" (כיבוי)
+      int state = data.toInt();
+      if (state == 1) {
+        digitalWrite(ledPin, HIGH);
+        systemOn = true;
+        Serial.println("System ON");
+      } else {
+        digitalWrite(ledPin, LOW);
+        systemOn = false;
+        Serial.println("System OFF");
+      }
+    }
+    else if (command == "SENSOR_VOLUME") {
       // Data format: "ID,VOLUME"
       int commaIndex = data.indexOf(',');
       if (commaIndex != -1) {
-        // substring(startIndex, endIndex) vs substring(startIndex)
-        // Arduino String::substring(from, to) or (from).
-        // It takes an index. Let's use substring carefully.
-        // String::substring(unsigned int left, unsigned int right)
-        // If right is not provided, end of string.
         String idStr = data.substring(0, commaIndex);
         String volStr = data.substring(commaIndex + 1);
-        
+
         int id = idStr.toInt();
         float volume = volStr.toFloat();
-        
+
         if (id >= 0 && id < 4) {
-          // Store max volume (0-100 -> 0.0-1.0)
-          // Ensure we don't exceed array bounds or valid float range
           if (volume < 0) volume = 0;
           if (volume > 100) volume = 100;
-          
+
           sensorMaxVol[id] = volume / 100.0f;
           Serial.printf("Set Sensor %d Max Vol: %f\n", id, sensorMaxVol[id]);
         }
       }
+    }
+    else if (command == "CALIBRATE") {
+      // חילוץ 4 המספרים מהמחרוזת, לדוגמה "CALIBRATE:280,310,295,305"
+      int commas[3];
+      commas[0] = data.indexOf(',');
+      commas[1] = data.indexOf(',', commas[0] + 1);
+      commas[2] = data.indexOf(',', commas[1] + 1);
+
+      if (commas[0] != -1 && commas[1] != -1 && commas[2] != -1) {
+        sensorBaselines[0] = data.substring(0, commas[0]).toInt();
+        sensorBaselines[1] = data.substring(commas[0] + 1, commas[1]).toInt();
+        sensorBaselines[2] = data.substring(commas[1] + 1, commas[2]).toInt();
+        sensorBaselines[3] = data.substring(commas[2] + 1).toInt();
+        Serial.printf("Calibrated Baselines: %d, %d, %d, %d\n", sensorBaselines[0], sensorBaselines[1], sensorBaselines[2], sensorBaselines[3]);
+      }
+    }
+    else if (command == "SENSOR_THRESHOLD") {
+      // פורמט: "SENSOR_THRESHOLD:T0,T1,T2,T3" - סף לכל חיישן ביח' ADC
+      int commas[3];
+      commas[0] = data.indexOf(',');
+      commas[1] = data.indexOf(',', commas[0] + 1);
+      commas[2] = data.indexOf(',', commas[1] + 1);
+
+      if (commas[0] != -1 && commas[1] != -1 && commas[2] != -1) {
+        sensorThresholds[0] = data.substring(0, commas[0]).toInt();
+        sensorThresholds[1] = data.substring(commas[0] + 1, commas[1]).toInt();
+        sensorThresholds[2] = data.substring(commas[1] + 1, commas[2]).toInt();
+        sensorThresholds[3] = data.substring(commas[2] + 1).toInt();
+        Serial.printf("Thresholds: %d, %d, %d, %d\n", sensorThresholds[0], sensorThresholds[1], sensorThresholds[2], sensorThresholds[3]);
+      }
+    }
+    else if (command == "VOLUME_TOTAL") {
+      // פורמט: "VOLUME_TOTAL:75" - ערך 0-100
+      float vol = data.toFloat();
+      if (vol < 0) vol = 0;
+      if (vol > 100) vol = 100;
+      masterVol = vol / 100.0f;
+      Serial.printf("Master Volume: %f\n", masterVol);
     }
   }
 };
@@ -268,7 +315,8 @@ void setup() {
 
   pLedCharacteristic = pService->createCharacteristic(
                       LED_CHARACTERISTIC_UUID,
-                      BLECharacteristic::PROPERTY_WRITE
+                      BLECharacteristic::PROPERTY_WRITE |
+                      BLECharacteristic::PROPERTY_WRITE_NR
                     );
 
   pLedCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
@@ -297,35 +345,41 @@ void loop() {
 
   // ---- Read Sensors ----
   int sensorValues[numSensors];
-  int maxVal = 0;
+  int maxForce = 0; // עכשיו אנחנו מחפשים את ה*כוח* המקסימלי (אחרי קיזוז הכיול) ולא את הערך הגולמי
   int maxIdx = -1;
   unsigned long timestamp = millis();
 
   for (int i = 0; i < numSensors; i++) {
     sensorValues[i] = analogRead(sensorPins[i]);
-    if (sensorValues[i] > maxVal) {
-      maxVal = sensorValues[i];
+
+    // חישוב הכוח הנקי על ידי חיסור ערך הכיול מהערך הנוכחי
+    int force = sensorValues[i] - sensorBaselines[i];
+    if (force < 0) force = 0; // התעלם מלחץ נמוך יותר ממצב המנוחה
+
+    if (force > maxForce) {
+      maxForce = force;
       maxIdx = i;
     }
   }
 
   // ---- Audio Logic (New Logic) ----
   static int currentWinner = -1;
-  
-  // Only run audio logic if system is ON
   if (systemOn) {
-    // Simple threshold logic from new sketch
-    if (maxVal > 300) { 
-        // Force calculation
-        float normalizedForce = (float)(maxVal - 300) / (4095 - 300); // 0.0 to 1.0
+    // בדיקה אם הכוח עובר את הסף של החיישן המוביל
+    if (maxIdx >= 0 && maxForce > sensorThresholds[maxIdx]) {
+
+        // חישוב הכוח בטווח מנורמל (מקו הכיול ועד המקסימום האפשרי)
+        float normalizedForce = (float)maxForce / (4095.0f - sensorBaselines[maxIdx]);
         if (normalizedForce < 0) normalizedForce = 0;
         if (normalizedForce > 1) normalizedForce = 1;
 
-        float scalingFactor = sensorMaxVol[maxIdx]; 
-        float baseVolume = 0.5f + (normalizedForce * 2.0f);
-        
-        VOL = baseVolume * scalingFactor;
-        
+        float scalingFactor = sensorMaxVol[maxIdx];
+
+        float baseVolume = 0.5f + (normalizedForce * 0.5f);
+        VOL = baseVolume * scalingFactor * masterVol;
+        // מניעת חריגה שגורמת לעיוות שמע
+        if (VOL > 1.0f) VOL = 1.0f;
+
         if (maxIdx != currentWinner) {
           currentWinner = maxIdx;
           targetTrack = currentWinner + 1; // Tracks 1..4
@@ -335,11 +389,11 @@ void loop() {
         // Signal below threshold -> silence
         VOL = 0.0f;
     }
-  } else { 
+  } else {
       // System is OFF
-      targetTrack = 0; // Stop
+      targetTrack = 0;
       currentWinner = -1;
-      VOL = 0.0f; // Silence
+      VOL = 0.0f;
   }
 
   // ---- BLE Logic ----

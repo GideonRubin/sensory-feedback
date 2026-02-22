@@ -15,6 +15,10 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
   useEffect(() => {
     // Initial check
     setIsConnected(EspApi.isConnected());
+    // Listen for unexpected BLE disconnections
+    EspApi.onDisconnect(() => {
+      setIsConnected(false);
+    });
   }, []);
 
   const connect = async () => {

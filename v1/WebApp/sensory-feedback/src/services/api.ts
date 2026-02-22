@@ -80,11 +80,18 @@ class SensorSimulator {
 
 const simulator = new SensorSimulator(4);
 let latestSensorData: Sensors = [];
+// Raw normalized values (0-100) before calibration subtraction - used for calibration
+let latestRawNormalized: number[] = [0, 0, 0, 0];
+// Calibration baselines stored in normalized 0-100 range for display adjustment
+let calibrationBaselines: number[] = [0, 0, 0, 0];
 
 /**
  * Communication between ESP32 and WebApp
  */
 export const EspApi = {
+  onDisconnect: (callback: () => void): void => {
+    bleService.onDisconnect(callback);
+  },
   connect: async (): Promise<void> => {
     await bleService.connect();
     bleService.subscribeToSensor((jsonString) => {
@@ -92,11 +99,15 @@ export const EspApi = {
             const parsed = JSON.parse(jsonString);
             latestSensorData = parsed.map((item: any) => ({
                 id: item.id,
-                data: item.data.map((d: any) => ({
-                    time: new Date(),
+                data: item.data.map((d: any) => {
                     // Normalize 12-bit ADC (0-4095) to 0-100 range
-                    amplitude: Math.min(100, (Number(d.amplitude) / 4095) * 100)
-                }))
+                    const normalized = Math.min(100, (Number(d.amplitude) / 4095) * 100);
+                    // Store raw normalized value for calibration use
+                    latestRawNormalized[item.id] = normalized;
+                    // Subtract calibration baseline so display shows force relative to rest
+                    const calibrated = Math.max(0, normalized - (calibrationBaselines[item.id] || 0));
+                    return { time: new Date(), amplitude: calibrated };
+                })
             }));
         } catch (e) {
             console.error("Error parsing sensor data", e);
@@ -143,17 +154,17 @@ export const EspApi = {
 
   // First Page
   switchOn: async (isOn: boolean): Promise<void> => {
-    // Send raw byte 1 or 0 for LED command to match firmware expectation
-    const payload = new Uint8Array([isOn ? 1 : 0]);
-    return bleService.write(payload);
+    // Use string command to avoid null byte (0x00) issue with Arduino String
+    const command = `POWER:${isOn ? '1' : '0'}`;
+    const encoder = new TextEncoder();
+    return bleService.write(encoder.encode(command));
   },
   ping: (): void => {
     // TODO: Implement communication with ESP32
     console.log('ping');
   },
   setVolumeTotal: (volume: number): void => {
-    // TODO: Implement communication with ESP32
-    console.log('setVolumeTotal', volume);
+    EspApi.write(BleEndpoints.VOLUME_TOTAL, `${volume}`);
   },
   getVolume: (): number => {
     // TODO: Implement communication with ESP32
@@ -184,8 +195,11 @@ export const EspApi = {
     return [];
   },
   setSensorsThreshold: (thresholds: number[]): void => {
-    // TODO: Implement communication with ESP32
-    console.log('setSensorsThreshold', thresholds);
+    // Convert from 0-100 range to raw ADC units (0-4095)
+    const rawThresholds = thresholds.map(v => Math.round((v / 100) * 4095));
+    const command = `SENSOR_THRESHOLD:${rawThresholds.join(',')}`;
+    const encoder = new TextEncoder();
+    bleService.write(encoder.encode(command));
   },
   getSensorVolume: (id: number): number => {
     // TODO: Implement communication with ESP32
@@ -195,6 +209,16 @@ export const EspApi = {
   setSensorVolume: (id: number, volume: number): void => {
     const data = `${id},${volume}`;
     EspApi.write(BleEndpoints.SENSOR_VOLUME, data);
+  },
+
+  calibrateSensors: async () => {
+    // Use the raw normalized values (before calibration subtraction)
+    calibrationBaselines = [...latestRawNormalized];
+    // Convert from normalized (0-100) back to raw ADC (0-4095)
+    const rawBaselines = calibrationBaselines.map(v => Math.round((v / 100) * 4095));
+    const command = `CALIBRATE:${rawBaselines.join(',')}`;
+    const encoder = new TextEncoder();
+    await bleService.write(encoder.encode(command));
   },
 };
 
