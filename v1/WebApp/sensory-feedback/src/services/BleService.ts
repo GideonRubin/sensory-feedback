@@ -144,14 +144,16 @@ class BleStubService implements IBleService {
   private sensorCallbacks: SensorCallback[] = [];
   private disconnectCallbacks: DisconnectCallback[] = [];
   private intervalId: any = null;
+  private mode: number = 0;          // 0 = accordion, 1 = song
+  private sensitivity: number = 75;  // 0-100 slider
+  private tick: number = 0;
 
   async connect(): Promise<void> {
     console.log('[STUB] Connecting...');
-    await new Promise(resolve => setTimeout(resolve, 500)); // Simulate delay
+    await new Promise(resolve => setTimeout(resolve, 500));
     this.connected = true;
+    this.tick = 0;
     console.log('[STUB] Connected!');
-    
-    // Start simulating sensor data
     this.startSimulatingData();
   }
 
@@ -170,15 +172,26 @@ class BleStubService implements IBleService {
       console.warn('[STUB] Not connected');
       return;
     }
-    console.log(`[STUB] Write bytes: ${Array.from(data)}`);
+    const cmd = new TextDecoder().decode(data);
+    console.log(`[STUB] Command: ${cmd}`);
+
+    // Parse commands like the real ESP32
+    const sep = cmd.indexOf(':');
+    if (sep === -1) return;
+    const command = cmd.substring(0, sep);
+    const value = cmd.substring(sep + 1);
+
+    if (command === 'MODE') {
+      this.mode = parseInt(value);
+      console.log(`[STUB] Mode → ${this.mode === 0 ? 'Accordion' : 'Song'}`);
+    } else if (command === 'SENSITIVITY') {
+      this.sensitivity = parseFloat(value);
+      console.log(`[STUB] Sensitivity → ${this.sensitivity}`);
+    }
   }
 
   async read(): Promise<Uint8Array> {
-    if (!this.connected) {
-      console.warn('[STUB] Not connected');
-      return new Uint8Array();
-    }
-    console.log(`[STUB] Read`);
+    if (!this.connected) return new Uint8Array();
     return new Uint8Array();
   }
 
@@ -194,24 +207,96 @@ class BleStubService implements IBleService {
     this.disconnectCallbacks.push(callback);
   }
 
+  // ---------- Simulation Engine ----------
+  // Matches real ESP32: compact JSON at 20Hz (50ms), raw ADC values 0-4095
+  // Song mode: intense, fast walking with bursts and overlapping foot strikes
+  // Accordion mode: gentler, steady walking pattern
+
   private startSimulatingData() {
     if (this.intervalId) return;
     this.intervalId = setInterval(() => {
-      // Simulate complex sensor data (4 sensors)
-      const now = Date.now() / 1000;
-      const data = [0, 1, 2, 3].map(id => {
-          // Send raw adc values (0-4095)
-          // Use simple sine waves with different phases
-          const rawValue = Math.max(0, Math.sin(now + id) * 2000 + 1000); 
-          return {
-              id,
-              data: [{ amplitude: Math.floor(rawValue) }]
-          };
-      });
+      this.tick++;
+      const t = this.tick * 0.05; // seconds (50ms per tick)
+      const ts = Date.now();
 
-      const jsonString = JSON.stringify(data);
-      this.sensorCallbacks.forEach(cb => cb(jsonString));
-    }, 100); // 10Hz simulator
+      let rf: number, lf: number, rb: number, lb: number; // raw ADC 0-4095
+
+      if (this.mode === 1) {
+        // ---- Song Mode: Intense walking simulation ----
+        // Fast walking cadence (~2 steps/sec = 120 BPM)
+        // Right foot: phase 0, Left foot: phase PI
+        // Within each foot: Back (heel) strikes first, Front (toe) pushes off after
+        const walkFreq = 2.0 * Math.PI * 1.0; // 1 full gait cycle per second
+        const rightPhase = t * walkFreq;
+        const leftPhase = t * walkFreq + Math.PI;
+
+        // Heel strike: sharp attack, quick decay (impact)
+        const heelStrike = (phase: number) => {
+          const p = ((phase % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+          // Narrow pulse at phase 0 (heel contact)
+          if (p < 0.8) return Math.pow(Math.cos(p * Math.PI / 1.6), 2);
+          return 0;
+        };
+
+        // Toe pushoff: slower build, moderate peak, comes after heel
+        const toePush = (phase: number) => {
+          const p = ((phase % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+          // Delayed pulse (starts at phase ~1.2, peaks at ~2.0)
+          if (p > 1.0 && p < 3.0) return Math.pow(Math.sin((p - 1.0) * Math.PI / 2.0), 2);
+          return 0;
+        };
+
+        // Random micro-bursts (simulate uneven ground, stumbles, tempo changes)
+        const burst = Math.sin(t * 7.3) > 0.85 ? 0.3 : 0;
+        const jitter = () => (Math.random() - 0.5) * 200; // ±200 ADC noise
+
+        // Sensitivity affects how raw values map (higher sensitivity = stronger signal)
+        const sensGain = 0.7 + (this.sensitivity / 100) * 0.6; // 0.7 to 1.3
+
+        // Raw ADC values (baseline ~300, max ~3800)
+        rf = 300 + (toePush(rightPhase) * 3200 + burst * 1500) * sensGain + jitter();
+        lf = 300 + (toePush(leftPhase) * 3200 + burst * 1200) * sensGain + jitter();
+        rb = 300 + (heelStrike(rightPhase) * 3500 + burst * 1800) * sensGain + jitter();
+        lb = 300 + (heelStrike(leftPhase) * 3500 + burst * 1600) * sensGain + jitter();
+
+        // Occasional "running" bursts: both feet active simultaneously
+        if (Math.sin(t * 0.3) > 0.7) {
+          const runBoost = 800 * Math.abs(Math.sin(t * 5));
+          rf += runBoost;
+          rb += runBoost * 1.2;
+        }
+
+      } else {
+        // ---- Accordion Mode: Steady, deliberate stepping ----
+        const walkFreq = 2.0 * Math.PI * 0.6; // slower walk (0.6 Hz)
+        const rightPhase = t * walkFreq;
+        const leftPhase = t * walkFreq + Math.PI;
+
+        const step = (phase: number) => {
+          const p = ((phase % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+          if (p < 2.5) return Math.pow(Math.sin(p * Math.PI / 2.5), 2);
+          return 0;
+        };
+
+        const jitter = () => (Math.random() - 0.5) * 100;
+
+        rf = 300 + step(rightPhase - 0.3) * 2800 + jitter();
+        lf = 300 + step(leftPhase - 0.3) * 2800 + jitter();
+        rb = 300 + step(rightPhase) * 2500 + jitter();
+        lb = 300 + step(leftPhase) * 2500 + jitter();
+      }
+
+      // Clamp to valid ADC range
+      const clamp = (v: number) => Math.max(0, Math.min(4095, Math.floor(v)));
+
+      // Send compact JSON format (matches real ESP32 firmware)
+      const json = JSON.stringify({
+        t: ts,
+        s: [clamp(rf), clamp(lf), clamp(rb), clamp(lb)]
+      });
+      this.sensorCallbacks.forEach(cb => cb(json));
+
+    }, 50); // 20Hz — matches real ESP32 loop delay
   }
 
   private stopSimulatingData() {
