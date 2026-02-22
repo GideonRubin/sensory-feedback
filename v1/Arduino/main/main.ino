@@ -11,6 +11,9 @@
 #include "driver/i2s_std.h"
 #include "esp_bt.h"
 #include "esp_gap_ble_api.h"
+#include <Preferences.h>
+
+Preferences prefs;
 
 // ---------- Audio & Pin Configuration ----------
 volatile float sensorMaxVol[4] = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -468,6 +471,7 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
     }
     else if (command == "MODE") {
       int mode = data.toInt();
+      prefs.putInt("mode", mode);  // persist to NVS — survives resets
       if (mode == 0) {
         audioMode = 0;
         needCloseSong = true;  // Audio task will close file on Core 1
@@ -479,7 +483,7 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
           voices[i].phaseInc2 = (freq * dr * WAVETABLE_SIZE) / (float)SAMPLE_RATE;
           voices[i].targetVol = 0.0f;
         }
-        Serial.println("Mode: Accordion");
+        Serial.println("Mode: Accordion (saved)");
       } else if (mode == 1) {
         // Song mode: silence all accordion voices
         for (int i = 0; i < NUM_VOICES; i++) {
@@ -488,7 +492,7 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
         resetFilterState();
         needOpenSong = true;  // Audio task will open file on Core 1
         audioMode = 1;
-        Serial.println("Mode: Song (file will open on audio core)");
+        Serial.println("Mode: Song (saved, file will open on audio core)");
       }
     }
     else if (command == "SENSITIVITY") {
@@ -536,6 +540,14 @@ void setup() {
     Serial.println("SD Init Failed!");
   } else {
     Serial.println("SD Card Ready");
+  }
+
+  // ---------- Restore saved mode from NVS ----------
+  prefs.begin("audio", false);
+  audioMode = prefs.getInt("mode", 0);  // default: accordion
+  Serial.printf("Restored mode: %d (%s)\n", audioMode, audioMode == 1 ? "Song" : "Accordion");
+  if (audioMode == 1) {
+    needOpenSong = true;  // Audio task will open song file after starting
   }
 
   // ---------- Synthesis Setup ----------
