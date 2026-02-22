@@ -64,8 +64,8 @@ float lpStateR = 0.0f;   // low-pass filter state, right channel
 // Sensor-controlled band levels:
 // At rest: song sounds muffled (treble low) and thin (bass reduced)
 // Walking: restores full frequency range
-volatile float trebleLevel = 0.2f;   // 0.2 base → 1.0 (front sensors restore brightness)
-volatile float bassLevel = 0.5f;     // 0.5 base → 1.0 (back sensors restore warmth)
+volatile float trebleLevel = 0.05f;  // 0.05 base → 1.0 (nearly muted highs at rest)
+volatile float bassLevel = 0.15f;   // 0.15 base → 1.0 (very thin at rest)
 
 #define I2S_BCLK_PIN  GPIO_NUM_27
 #define I2S_WS_PIN    GPIO_NUM_14
@@ -127,9 +127,9 @@ void generateAccordionWavetable() {
 void resetFilterState() {
   lpStateL = 0.0f;
   lpStateR = 0.0f;
-  trebleLevel = 0.2f;
-  bassLevel = 0.5f;
-  Serial.println("Filter initialized (bass/treble split at 800Hz).");
+  trebleLevel = 0.05f;
+  bassLevel = 0.15f;
+  Serial.println("Filter initialized (bass/treble split at 600Hz).");
 }
 
 // ---------- Song File Helper ----------
@@ -537,9 +537,9 @@ void loop() {
       // Front sensors → restore TREBLE (brightness/detail)
       if (frontActive > 0) {
         float avgForce = frontForceSum / (float)frontActive;
-        trebleLevel = 0.2f + avgForce * 0.8f;    // 0.2 → 1.0 (muffled → bright)
+        trebleLevel = 0.05f + avgForce * 0.95f;   // 0.05 → 1.0 (nearly muted → full bright)
       } else {
-        trebleLevel = 0.2f;
+        trebleLevel = 0.05f;
       }
 
       // Back sensors (2,3): restore BASS (warmth/depth)
@@ -556,14 +556,14 @@ void loop() {
         }
       }
       // Back sensors → bass restored: thin → full warmth
-      bassLevel = 0.5f + backForceMax * 0.5f;    // 0.5 → 1.0
+      bassLevel = 0.15f + backForceMax * 0.85f;   // 0.15 → 1.0
     }
   } else {
     for (int i = 0; i < NUM_VOICES; i++) {
       voices[i].targetVol = 0.0f;
     }
-    trebleLevel = 0.2f;
-    bassLevel = 0.5f;
+    trebleLevel = 0.05f;
+    bassLevel = 0.15f;
   }
 
   // ---- BLE Logic ----
