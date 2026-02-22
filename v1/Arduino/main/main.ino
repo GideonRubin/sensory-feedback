@@ -46,7 +46,7 @@ Voice voices[NUM_VOICES];
 
 // Tremolo LFO for bellows simulation (~5Hz gentle wobble)
 float tremoloPhase = 0.0f;
-#define TREMOLO_RATE  (5.0f * WAVETABLE_SIZE / (float)SAMPLE_RATE)  // 5Hz in phase increments
+#define TREMOLO_HZ    5.0f
 #define TREMOLO_DEPTH 0.08f   // subtle ±8% volume modulation
 
 // ---------- Audio Mode ----------
@@ -244,8 +244,9 @@ void audioTask(void *parameter) {
 
     // ---- Mode 0: Accordion wavetable synthesis (dual detuned oscillators + tremolo) ----
     if (currentMode == 0) {
-      // Tremolo LFO: gentle bellows simulation
+      // Pre-compute tremolo LFO for entire buffer (simple sine, computed once)
       float tPhase = tremoloPhase;
+      const float tPhaseInc = (2.0f * PI * TREMOLO_HZ) / (float)SAMPLE_RATE;
 
       for (int v = 0; v < NUM_VOICES; v++) {
         float phase = voices[v].phaseAccumulator;
@@ -254,61 +255,52 @@ void audioTask(void *parameter) {
         float phaseInc2 = voices[v].phaseInc2;
         float target = voices[v].targetVol;
         float current = voices[v].currentVol;
-        float panL = voices[v].panL;
-        float panR = voices[v].panR;
+        float pL = voices[v].panL;
+        float pR = voices[v].panR;
+        float localTPhase = tremoloPhase;  // each voice reads same tremolo
 
         for (int f = 0; f < (int)numFrames; f++) {
           float alpha = (target > current) ? attackAlpha : releaseAlpha;
           current += alpha * (target - current);
 
           // First oscillator (slightly flat)
-          int idx0 = (int)phase;
+          int idx0 = (int)phase & (WAVETABLE_SIZE - 1);
           int idx1 = (idx0 + 1) & (WAVETABLE_SIZE - 1);
-          float frac = phase - (float)idx0;
-          idx0 &= (WAVETABLE_SIZE - 1);
+          float frac = phase - (float)(int)phase;
           float sample1 = (float)wavetable[idx0] + frac * (float)(wavetable[idx1] - wavetable[idx0]);
 
           // Second oscillator (slightly sharp) — creates natural beating
-          int idx2 = (int)phase2;
+          int idx2 = (int)phase2 & (WAVETABLE_SIZE - 1);
           int idx3 = (idx2 + 1) & (WAVETABLE_SIZE - 1);
-          float frac2 = phase2 - (float)idx2;
-          idx2 &= (WAVETABLE_SIZE - 1);
+          float frac2 = phase2 - (float)(int)phase2;
           float sample2 = (float)wavetable[idx2] + frac2 * (float)(wavetable[idx3] - wavetable[idx2]);
 
           // Mix both oscillators (equal blend for chorus effect)
           float sample = (sample1 + sample2) * 0.5f;
 
-          // Apply tremolo (bellows wobble) — only when voice is active
-          float tIdx = (int)tPhase & (WAVETABLE_SIZE - 1);
-          float tFrac = tPhase - (float)(int)tPhase;
-          int tIdx1 = ((int)tPhase + 1) & (WAVETABLE_SIZE - 1);
-          float lfo = (float)wavetable[(int)tIdx] + tFrac * (float)(wavetable[tIdx1] - wavetable[(int)tIdx]);
-          // Normalize LFO to -1..+1 range (wavetable peak is ~8191 with 0.25 scale)
-          float tremoloMod = 1.0f + (lfo / 8192.0f) * TREMOLO_DEPTH;
+          // Tremolo: clean sine LFO (bellows wobble)
+          float tremoloMod = 1.0f + sinf(localTPhase) * TREMOLO_DEPTH;
 
           float out = sample * current * tremoloMod;
 
           int bufIdx = f * 2;
-          buffer[bufIdx]     += (int16_t)(out * panL);
-          buffer[bufIdx + 1] += (int16_t)(out * panR);
+          buffer[bufIdx]     += (int16_t)(out * pL);
+          buffer[bufIdx + 1] += (int16_t)(out * pR);
 
           phase += phaseInc;
           if (phase >= (float)WAVETABLE_SIZE) phase -= (float)WAVETABLE_SIZE;
           phase2 += phaseInc2;
           if (phase2 >= (float)WAVETABLE_SIZE) phase2 -= (float)WAVETABLE_SIZE;
-
-          // Advance tremolo (shared across all voices, only increment once)
-          if (v == 0) {
-            tPhase += TREMOLO_RATE;
-            if (tPhase >= (float)WAVETABLE_SIZE) tPhase -= (float)WAVETABLE_SIZE;
-          }
+          localTPhase += tPhaseInc;
         }
 
         voices[v].phaseAccumulator = phase;
         voices[v].phase2 = phase2;
         voices[v].currentVol = current;
       }
-      tremoloPhase = tPhase;
+      // Update global tremolo phase (advance by numFrames steps)
+      tremoloPhase += tPhaseInc * (float)numFrames;
+      if (tremoloPhase > 2.0f * PI) tremoloPhase -= 2.0f * PI;
     }
 
     // Clamp to prevent overflow (Mode 0 accumulates, Mode 1 already clamped inline)
@@ -515,7 +507,7 @@ void setup() {
   i2s_channel_init_std_mode(tx_handle, &std_cfg);
   
   // Start Audio Task on Core 0 (leaving Core 1 for Arduino Loop/BLE)
-  xTaskCreatePinnedToCore(audioTask, "AudioTask", 12288, NULL, 10, NULL, 0);
+  xTaskCreatePinnedToCore(audioTask, "AudioTask", 16384, NULL, 10, NULL, 0);
   Serial.println("Audio Task Started.");
 
   // ---------- BLE Init ----------
@@ -635,21 +627,19 @@ void loop() {
 
   // ---- BLE Logic ----
   if (deviceConnected) {
-    // Construct JSON string
-    String json = "[";
+    // Fixed-size buffer — zero heap allocation, prevents memory fragmentation
+    char json[320];
+    int pos = 0;
+    pos += snprintf(json + pos, sizeof(json) - pos, "[");
     for (int i = 0; i < numSensors; i++) {
-      if (i > 0) json += ",";
-      json += "{\"id\":";
-      json += i;
-      json += ",\"data\":[{\"time\":\"";
-      json += timestamp;
-      json += "\",\"amplitude\":";
-      json += sensorValues[i];
-      json += "}]}";
+      if (i > 0) pos += snprintf(json + pos, sizeof(json) - pos, ",");
+      pos += snprintf(json + pos, sizeof(json) - pos,
+        "{\"id\":%d,\"data\":[{\"time\":\"%lu\",\"amplitude\":%d}]}",
+        i, timestamp, sensorValues[i]);
     }
-    json += "]";
+    snprintf(json + pos, sizeof(json) - pos, "]");
 
-    pSensorCharacteristic->setValue(json.c_str());
+    pSensorCharacteristic->setValue(json);
     pSensorCharacteristic->notify();
   }
 
