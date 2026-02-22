@@ -50,22 +50,38 @@ File songFile;
 bool songFileOpen = false;
 #define WAV_HEADER_SIZE 44
 
-// Mode 1: Frequency-band filtering
-// Split song into BASS and TREBLE using single-pole low-pass at ~800Hz
-// Walking restores the filtered-out frequencies = always positive enrichment
+// Mode 1: Per-channel frequency-band filtering with hold+decay
+// Right foot → right speaker, Left foot → left speaker
+// Walking restores filtered frequencies, holds 1.5s, then decays
 //
-// Low-pass alpha for 600Hz cutoff at 22050Hz sample rate:
-// alpha = 2*PI*600 / (2*PI*600 + 22050) ≈ 0.146
-// Lower cutoff = more of the audible range is in "treble" → bigger effect on cheap speakers
+// Low-pass filter at 600Hz: alpha = 2*PI*600 / (2*PI*600 + 22050) ≈ 0.146
 #define LP_ALPHA 0.146f
 float lpStateL = 0.0f;   // low-pass filter state, left channel
 float lpStateR = 0.0f;   // low-pass filter state, right channel
 
-// Sensor-controlled band levels:
-// At rest: song sounds muffled (treble low) and thin (bass reduced)
-// Walking: restores full frequency range
-volatile float trebleLevel = 0.05f;  // 0.05 base → 1.0 (nearly muted highs at rest)
-volatile float bassLevel = 0.15f;   // 0.15 base → 1.0 (very thin at rest)
+// Base levels (at rest / fully decayed)
+#define TREBLE_BASE 0.05f
+#define BASS_BASE   0.15f
+
+// Hold + decay timing
+#define HOLD_TIME_MS 1500       // hold peak level for 1.5 seconds
+#define DECAY_PER_LOOP 0.016f   // decay speed (~1.5s from peak to base at 25ms loop)
+
+// Per-channel band levels (read by audio task)
+volatile float trebleLvlR = TREBLE_BASE;  // right speaker treble (sensor 0)
+volatile float trebleLvlL = TREBLE_BASE;  // left speaker treble (sensor 1)
+volatile float bassLvlR   = BASS_BASE;    // right speaker bass (sensor 2)
+volatile float bassLvlL   = BASS_BASE;    // left speaker bass (sensor 3)
+
+// Hold/decay state per sensor band
+struct BandHold {
+  float peak;                // peak level from last press
+  unsigned long lastActive;  // millis() when sensor was last above threshold
+};
+BandHold holdTrebleR = {TREBLE_BASE, 0};
+BandHold holdTrebleL = {TREBLE_BASE, 0};
+BandHold holdBassR   = {BASS_BASE, 0};
+BandHold holdBassL   = {BASS_BASE, 0};
 
 #define I2S_BCLK_PIN  GPIO_NUM_27
 #define I2S_WS_PIN    GPIO_NUM_14
@@ -127,9 +143,11 @@ void generateAccordionWavetable() {
 void resetFilterState() {
   lpStateL = 0.0f;
   lpStateR = 0.0f;
-  trebleLevel = 0.05f;
-  bassLevel = 0.15f;
-  Serial.println("Filter initialized (bass/treble split at 600Hz).");
+  trebleLvlR = TREBLE_BASE; trebleLvlL = TREBLE_BASE;
+  bassLvlR = BASS_BASE;     bassLvlL = BASS_BASE;
+  holdTrebleR = {TREBLE_BASE, 0}; holdTrebleL = {TREBLE_BASE, 0};
+  holdBassR = {BASS_BASE, 0};    holdBassL = {BASS_BASE, 0};
+  Serial.println("Filter initialized (per-channel, 600Hz split, 1.5s hold).");
 }
 
 // ---------- Song File Helper ----------
@@ -182,29 +200,30 @@ void audioTask(void *parameter) {
       }
 
       float mv = masterVol;
-      float bLvl = bassLevel;
-      float tLvl = trebleLevel;
+      // Per-channel levels: right foot → right speaker, left foot → left speaker
+      float tR = trebleLvlR, tL = trebleLvlL;
+      float bR = bassLvlR,   bL = bassLvlL;
 
       for (int f = 0; f < (int)numFrames; f++) {
         int idx = f * 2;
         float rawL = (float)songBuf[idx];
         float rawR = (float)songBuf[idx + 1];
 
-        // Single-pole low-pass filter: splits into bass + treble
+        // Single-pole low-pass filter: splits into bass + treble per channel
         lpStateL += LP_ALPHA * (rawL - lpStateL);
         lpStateR += LP_ALPHA * (rawR - lpStateR);
 
-        // Bass = low-pass output (frequencies below ~800Hz)
-        // Treble = original minus low-pass (frequencies above ~800Hz)
-        float bassL = lpStateL;
-        float bassR = lpStateR;
-        float trebL = rawL - lpStateL;
-        float trebR = rawR - lpStateR;
+        // Split each channel into bass and treble bands
+        float bassLeft  = lpStateL;
+        float bassRight = lpStateR;
+        float trebLeft  = rawL - lpStateL;
+        float trebRight = rawR - lpStateR;
 
-        // Reconstruct: sensor-controlled mix of bass + treble
-        // At rest: muffled (low treble). Walking: full spectrum restored.
-        float outL = (bassL * bLvl + trebL * tLvl) * mv;
-        float outR = (bassR * bLvl + trebR * tLvl) * mv;
+        // Reconstruct: each speaker controlled by its foot's sensors
+        // Left speaker = left foot sensors (1,3)
+        // Right speaker = right foot sensors (0,2)
+        float outL = (bassLeft * bL + trebLeft * tL) * mv;
+        float outR = (bassRight * bR + trebRight * tR) * mv;
 
         // Clamp output
         int32_t iL = (int32_t)outL;
@@ -516,54 +535,51 @@ void loop() {
         }
       }
     } else {
-      // Mode 1: Song manipulation (echo/doubling + tremolo)
-      // Front sensors (0,1): control echo wet mix + song volume boost
-      float frontForceSum = 0.0f;
-      int frontActive = 0;
+      // Mode 1: Per-channel frequency filter with hold+decay
+      // Each sensor controls one band on one speaker
+      unsigned long now = millis();
 
-      for (int i = 0; i < 2; i++) {
-        int force = sensorValues[i] - sensorBaselines[i];
-        if (force < 0) force = 0;
+      // Helper: update a band level with hold+decay logic
+      // Returns the new output level
+      #define UPDATE_BAND(sensorIdx, baseVal, hold, outVar) do { \
+        int force = sensorValues[sensorIdx] - sensorBaselines[sensorIdx]; \
+        if (force < 0) force = 0; \
+        if (force > sensorThresholds[sensorIdx]) { \
+          float maxRange = 4095.0f - sensorBaselines[sensorIdx]; \
+          float nf = (float)force / maxRange; \
+          if (nf > 1.0f) nf = 1.0f; \
+          float level = baseVal + nf * (1.0f - baseVal); \
+          hold.peak = level; \
+          hold.lastActive = now; \
+          outVar = level; \
+        } else { \
+          unsigned long elapsed = now - hold.lastActive; \
+          if (elapsed < HOLD_TIME_MS) { \
+            outVar = hold.peak; \
+          } else { \
+            float decayed = hold.peak - DECAY_PER_LOOP; \
+            if (decayed < baseVal) decayed = baseVal; \
+            hold.peak = decayed; \
+            outVar = decayed; \
+          } \
+        } \
+      } while(0)
 
-        if (force > sensorThresholds[i]) {
-          float maxRange = 4095.0f - sensorBaselines[i];
-          float normalizedForce = (float)force / maxRange;
-          if (normalizedForce > 1.0f) normalizedForce = 1.0f;
-          frontForceSum += normalizedForce;
-          frontActive++;
-        }
-      }
-
-      // Front sensors → restore TREBLE (brightness/detail)
-      if (frontActive > 0) {
-        float avgForce = frontForceSum / (float)frontActive;
-        trebleLevel = 0.05f + avgForce * 0.95f;   // 0.05 → 1.0 (nearly muted → full bright)
-      } else {
-        trebleLevel = 0.05f;
-      }
-
-      // Back sensors (2,3): restore BASS (warmth/depth)
-      float backForceMax = 0.0f;
-      for (int i = 2; i < 4; i++) {
-        int force = sensorValues[i] - sensorBaselines[i];
-        if (force < 0) force = 0;
-
-        if (force > sensorThresholds[i]) {
-          float maxRange = 4095.0f - sensorBaselines[i];
-          float normalizedForce = (float)force / maxRange;
-          if (normalizedForce > 1.0f) normalizedForce = 1.0f;
-          if (normalizedForce > backForceMax) backForceMax = normalizedForce;
-        }
-      }
-      // Back sensors → bass restored: thin → full warmth
-      bassLevel = 0.15f + backForceMax * 0.85f;   // 0.15 → 1.0
+      // Sensor 0 (Right Front) → treble on RIGHT speaker
+      UPDATE_BAND(0, TREBLE_BASE, holdTrebleR, trebleLvlR);
+      // Sensor 1 (Left Front) → treble on LEFT speaker
+      UPDATE_BAND(1, TREBLE_BASE, holdTrebleL, trebleLvlL);
+      // Sensor 2 (Right Back) → bass on RIGHT speaker
+      UPDATE_BAND(2, BASS_BASE, holdBassR, bassLvlR);
+      // Sensor 3 (Left Back) → bass on LEFT speaker
+      UPDATE_BAND(3, BASS_BASE, holdBassL, bassLvlL);
     }
   } else {
     for (int i = 0; i < NUM_VOICES; i++) {
       voices[i].targetVol = 0.0f;
     }
-    trebleLevel = 0.05f;
-    bassLevel = 0.15f;
+    trebleLvlR = TREBLE_BASE; trebleLvlL = TREBLE_BASE;
+    bassLvlR = BASS_BASE;     bassLvlL = BASS_BASE;
   }
 
   // ---- BLE Logic ----

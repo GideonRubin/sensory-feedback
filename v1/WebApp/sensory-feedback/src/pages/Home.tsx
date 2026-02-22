@@ -55,11 +55,28 @@ export function Home() {
     setNotification({ message, type });
   }
 
+  const syncStateToDevice = async () => {
+    // Small delay to let BLE connection stabilize
+    await new Promise(resolve => setTimeout(resolve, 300));
+    try {
+      await EspApi.setMode(audioMode);
+      EspApi.setVolumeTotal(volume[0]);
+      for (let i = 0; i < 4; i++) {
+        EspApi.setSensorVolume(i, volume[0]);
+      }
+      await EspApi.switchOn(ledState);
+    } catch (error) {
+      console.error('Failed to sync state:', error);
+    }
+  }
+
   const handleConnectionToggle = async (checked: boolean) => {
     if (checked) {
       try {
         await connect()
         showNotification('Connected successfully', 'success')
+        // Sync all UI state to device after connection
+        syncStateToDevice()
       } catch (error) {
         console.error('Failed to connect:', error)
         showNotification('Failed to connect', 'error')
