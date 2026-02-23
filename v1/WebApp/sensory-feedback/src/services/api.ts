@@ -104,6 +104,12 @@ export const EspApi = {
     bleService.subscribeToSensor((jsonString) => {
         try {
             const parsed = JSON.parse(jsonString);
+            // FIX: Ignore heartbeat messages from ESP32 (sent when loop() is stalled)
+            // These keep BLE alive but contain no sensor data
+            if (parsed.hb !== undefined) {
+                console.debug('BLE heartbeat received');
+                return;
+            }
             // Compact format: {"t":millis,"s":[val0,val1,val2,val3]}
             if (parsed.s && Array.isArray(parsed.s)) {
                 latestSensorData = parsed.s.map((amplitude: number, index: number) => {

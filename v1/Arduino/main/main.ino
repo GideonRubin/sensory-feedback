@@ -1,5 +1,13 @@
 /*
   TOM Project
+  --- BLE Disconnect Fix ---
+  Changes from original:
+  1. Larger SD read buffer (256→512 frames) — fewer SPI transactions
+  2. SD double-buffering (prefetch) — reads happen while I2S plays previous buffer
+  3. Adaptive vTaskDelay (8ms in song mode vs 2ms accordion) — lets loop() run
+  4. Zero-allocation BLE command parser (char[] instead of Arduino String)
+  5. BLE heartbeat watchdog — bleNotifyTask sends keepalive if loop() is stalled
+  6. Heap-low safety — logs warning and throttles when heap drops below 30KB
   */
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -78,6 +86,11 @@ volatile bool needCloseSong = false;
 char blePayload[80];
 volatile bool bleNeedsSend = false;
 
+// FIX #5: BLE heartbeat — track when loop() last updated blePayload
+// If loop() is starved for >2s, bleNotifyTask sends a keepalive heartbeat
+volatile unsigned long lastBleUpdateMs = 0;
+#define BLE_HEARTBEAT_TIMEOUT_MS 2000
+
 // Mode 1: Per-channel frequency-band filtering with hold+decay
 // Right foot → right speaker, Left foot → left speaker
 // Walking restores filtered frequencies, holds 1.5s, then decays
@@ -120,7 +133,7 @@ BandHold holdBassL   = {BASS_BASE, 0};
 #define SPI_MOSI      23
 
 // Define sensor pins (ADC pins on ESP32)
-const int sensorPins[] = {34, 35, 32, 33}; 
+const int sensorPins[] = {34, 35, 32, 33};
 const int numSensors = 4;
 const int ledPin = 2; // Use the appropriate GPIO pin for your setup
 
@@ -138,6 +151,9 @@ bool oldDeviceConnected = false;
 #define SERVICE_UUID        "19b10000-e8f2-537e-4f6c-d104768a1214"
 #define SENSOR_CHARACTERISTIC_UUID "19b10001-e8f2-537e-4f6c-d104768a1214"
 #define LED_CHARACTERISTIC_UUID "19b10002-e8f2-537e-4f6c-d104768a1214"
+
+// FIX #6: Heap safety threshold
+#define HEAP_LOW_THRESHOLD 30000  // 30KB — below this, throttle audio to free CPU
 
 // ---------- Wavetable Generation ----------
 void generateAccordionWavetable() {
@@ -195,18 +211,44 @@ void openSongFile() {
   }
 }
 
+// ---------- FIX #4: Zero-allocation BLE command parser ----------
+// Replaces Arduino String with fixed char buffers to prevent heap fragmentation.
+// BLE max write is 512 bytes; 128 is plenty for our commands.
+#define CMD_BUF_SIZE 128
+
+// Parse comma-separated ints from a char* buffer. Returns count parsed.
+static int parseCsvInts(const char *str, int *out, int maxOut) {
+  int count = 0;
+  const char *p = str;
+  while (*p && count < maxOut) {
+    out[count++] = atoi(p);
+    // Skip to next comma or end
+    while (*p && *p != ',') p++;
+    if (*p == ',') p++;
+  }
+  return count;
+}
+
 // ---------- Audio Task (Dual Mode) ----------
+// FIX #1: Larger buffer (512 frames) — fewer SD transactions per second
+// FIX #2: Double buffering — prefetch next SD block while I2S plays current
 void audioTask(void *parameter) {
-  const size_t numFrames = 256;
+  const size_t numFrames = 512;   // FIX #1: doubled from 256
   const size_t bufSize = numFrames * 2 * sizeof(int16_t); // stereo 16-bit
   int16_t *buffer = (int16_t *)heap_caps_malloc(bufSize, MALLOC_CAP_DMA);
-  int16_t *songBuf = (int16_t *)heap_caps_malloc(bufSize, MALLOC_CAP_DMA);
+  // FIX #2: Two song buffers for ping-pong double buffering
+  int16_t *songBufA = (int16_t *)heap_caps_malloc(bufSize, MALLOC_CAP_DMA);
+  int16_t *songBufB = (int16_t *)heap_caps_malloc(bufSize, MALLOC_CAP_DMA);
 
-  if (buffer == NULL || songBuf == NULL) {
+  if (buffer == NULL || songBufA == NULL || songBufB == NULL) {
     Serial.println("Failed to allocate audio buffers");
     vTaskDelete(NULL);
     return;
   }
+
+  // Double-buffer state: which buffer has valid prefetched data
+  int16_t *songReady = NULL;     // buffer with prefetched data (NULL = none)
+  size_t   songReadyBytes = 0;   // how many bytes were prefetched
 
   i2s_channel_enable(tx_handle);
 
@@ -219,11 +261,13 @@ void audioTask(void *parameter) {
     if (needCloseSong) {
       needCloseSong = false;
       if (songFileOpen) { songFile.close(); songFileOpen = false; }
+      songReady = NULL;  // invalidate prefetch
       Serial.println("Song file closed (audio task)");
     }
     if (needOpenSong) {
       needOpenSong = false;
       openSongFile();
+      songReady = NULL;  // invalidate prefetch
       Serial.println("Song file opened (audio task)");
     }
 
@@ -233,10 +277,25 @@ void audioTask(void *parameter) {
 
     // ---- Mode 1: Song + frequency filter ----
     if (currentMode == 1 && songFileOpen) {
-      size_t bytesRead = songFile.read((uint8_t*)songBuf, bufSize);
-      taskYIELD();  // yield after blocking SD read to let loop() run
+      // FIX #2: Use prefetched buffer if available, otherwise read now
+      int16_t *songBuf;
+      size_t bytesRead;
+      if (songReady != NULL) {
+        // Use the prefetched data — no SD wait!
+        songBuf = songReady;
+        bytesRead = songReadyBytes;
+        songReady = NULL;
+      } else {
+        // First iteration or after seek — must read synchronously
+        songBuf = songBufA;
+        bytesRead = songFile.read((uint8_t*)songBuf, bufSize);
+      }
+
+      // FIX #3: Yield after SD read to let loop() run (longer yield in song mode)
+      vTaskDelay(pdMS_TO_TICKS(1));  // brief yield between SD read and processing
+
       if (bytesRead < bufSize) {
-        // At song end: pad with silence, rewind for next cycle (avoids 2nd SD read)
+        // At song end: pad with silence, rewind for next cycle
         memset((uint8_t*)songBuf + bytesRead, 0, bufSize - bytesRead);
         songFile.seek(WAV_HEADER_SIZE);
       }
@@ -273,6 +332,22 @@ void audioTask(void *parameter) {
         buffer[idx]     = (int16_t)(iL > 32767 ? 32767 : (iL < -32768 ? -32768 : iL));
         buffer[idx + 1] = (int16_t)(iR > 32767 ? 32767 : (iR < -32768 ? -32768 : iR));
       }
+
+      // FIX #2: Prefetch next block into the OTHER buffer while I2S plays this one.
+      // This way the next iteration won't block on SD read.
+      int16_t *prefetchBuf = (songBuf == songBufA) ? songBufB : songBufA;
+      songReadyBytes = songFile.read((uint8_t*)prefetchBuf, bufSize);
+      if (songReadyBytes < bufSize) {
+        memset((uint8_t*)prefetchBuf + songReadyBytes, 0, bufSize - songReadyBytes);
+        songFile.seek(WAV_HEADER_SIZE);
+        // Re-read from beginning for seamless loop
+        size_t remaining = bufSize - songReadyBytes;
+        if (remaining > 0 && songFileOpen) {
+          songFile.read((uint8_t*)prefetchBuf + songReadyBytes, remaining);
+          songReadyBytes = bufSize;
+        }
+      }
+      songReady = prefetchBuf;
     }
 
     // ---- Mode 0: Accordion wavetable synthesis (dual detuned oscillators + tremolo) ----
@@ -345,8 +420,19 @@ void audioTask(void *parameter) {
     size_t bytesWritten = 0;
     i2s_channel_write(tx_handle, buffer, bufSize, &bytesWritten, portMAX_DELAY);
 
-    // Yield to let loop() run on same core
-    vTaskDelay(pdMS_TO_TICKS(2));
+    // FIX #3: Adaptive yield — song mode needs more yield for loop() to update BLE
+    // Accordion mode: pure CPU math, very fast → short yield
+    // Song mode: SD I/O already took time, but loop() still needs its turn
+    if (currentMode == 1) {
+      vTaskDelay(pdMS_TO_TICKS(8));   // 8ms yield in song mode — lets loop() run reliably
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(2));   // 2ms in accordion mode — synthesis is lightweight
+    }
+
+    // FIX #6: If heap is critically low, add extra delay to reduce pressure
+    if (ESP.getFreeHeap() < HEAP_LOW_THRESHOLD) {
+      vTaskDelay(pdMS_TO_TICKS(10));  // emergency throttle
+    }
   }
 }
 
@@ -371,6 +457,9 @@ class MyServerCallbacks: public BLEServerCallbacks {
   }
 };
 
+// FIX #4: Zero-allocation BLE command parser
+// Uses stack-allocated char arrays instead of Arduino String to prevent
+// heap fragmentation that causes BLE stack memory allocation failures.
 class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* pCharacteristic) {
     String value = pCharacteristic->getValue();
@@ -389,19 +478,23 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
       return;
     }
 
-    // Parse string command: "CMD:DATA"
-    String cmdStr = value;
-    int separatorIndex = cmdStr.indexOf(':');
-    
-    // If no separator, it might be a raw command or just garbage, ignore or handle differently
-    if (separatorIndex == -1) return;
+    // Copy to stack buffer to avoid any heap allocation
+    char buf[CMD_BUF_SIZE];
+    size_t len = value.length();
+    if (len >= CMD_BUF_SIZE) len = CMD_BUF_SIZE - 1;
+    memcpy(buf, value.c_str(), len);
+    buf[len] = '\0';
 
-    String command = cmdStr.substring(0, separatorIndex);
-    String data = cmdStr.substring(separatorIndex + 1);
+    // Find separator ':'
+    char *sep = strchr(buf, ':');
+    if (sep == NULL) return;
 
-    if (command == "POWER") {
-      // פורמט: "POWER:1" (הפעלה) או "POWER:0" (כיבוי)
-      int state = data.toInt();
+    *sep = '\0';           // split: buf = command, sep+1 = data
+    const char *command = buf;
+    const char *data = sep + 1;
+
+    if (strcmp(command, "POWER") == 0) {
+      int state = atoi(data);
       if (state == 1) {
         digitalWrite(ledPin, HIGH);
         systemOn = true;
@@ -412,15 +505,12 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
         Serial.println("System OFF");
       }
     }
-    else if (command == "SENSOR_VOLUME") {
+    else if (strcmp(command, "SENSOR_VOLUME") == 0) {
       // Data format: "ID,VOLUME"
-      int commaIndex = data.indexOf(',');
-      if (commaIndex != -1) {
-        String idStr = data.substring(0, commaIndex);
-        String volStr = data.substring(commaIndex + 1);
-
-        int id = idStr.toInt();
-        float volume = volStr.toFloat();
+      const char *comma = strchr(data, ',');
+      if (comma != NULL) {
+        int id = atoi(data);
+        float volume = atof(comma + 1);
 
         if (id >= 0 && id < 4) {
           if (volume < 0) volume = 0;
@@ -431,46 +521,31 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
         }
       }
     }
-    else if (command == "CALIBRATE") {
-      // חילוץ 4 המספרים מהמחרוזת, לדוגמה "CALIBRATE:280,310,295,305"
-      int commas[3];
-      commas[0] = data.indexOf(',');
-      commas[1] = data.indexOf(',', commas[0] + 1);
-      commas[2] = data.indexOf(',', commas[1] + 1);
-
-      if (commas[0] != -1 && commas[1] != -1 && commas[2] != -1) {
-        sensorBaselines[0] = data.substring(0, commas[0]).toInt();
-        sensorBaselines[1] = data.substring(commas[0] + 1, commas[1]).toInt();
-        sensorBaselines[2] = data.substring(commas[1] + 1, commas[2]).toInt();
-        sensorBaselines[3] = data.substring(commas[2] + 1).toInt();
-        Serial.printf("Calibrated Baselines: %d, %d, %d, %d\n", sensorBaselines[0], sensorBaselines[1], sensorBaselines[2], sensorBaselines[3]);
+    else if (strcmp(command, "CALIBRATE") == 0) {
+      int vals[4];
+      if (parseCsvInts(data, vals, 4) == 4) {
+        for (int i = 0; i < 4; i++) sensorBaselines[i] = vals[i];
+        Serial.printf("Calibrated Baselines: %d, %d, %d, %d\n",
+          sensorBaselines[0], sensorBaselines[1], sensorBaselines[2], sensorBaselines[3]);
       }
     }
-    else if (command == "SENSOR_THRESHOLD") {
-      // פורמט: "SENSOR_THRESHOLD:T0,T1,T2,T3" - סף לכל חיישן ביח' ADC
-      int commas[3];
-      commas[0] = data.indexOf(',');
-      commas[1] = data.indexOf(',', commas[0] + 1);
-      commas[2] = data.indexOf(',', commas[1] + 1);
-
-      if (commas[0] != -1 && commas[1] != -1 && commas[2] != -1) {
-        sensorThresholds[0] = data.substring(0, commas[0]).toInt();
-        sensorThresholds[1] = data.substring(commas[0] + 1, commas[1]).toInt();
-        sensorThresholds[2] = data.substring(commas[1] + 1, commas[2]).toInt();
-        sensorThresholds[3] = data.substring(commas[2] + 1).toInt();
-        Serial.printf("Thresholds: %d, %d, %d, %d\n", sensorThresholds[0], sensorThresholds[1], sensorThresholds[2], sensorThresholds[3]);
+    else if (strcmp(command, "SENSOR_THRESHOLD") == 0) {
+      int vals[4];
+      if (parseCsvInts(data, vals, 4) == 4) {
+        for (int i = 0; i < 4; i++) sensorThresholds[i] = vals[i];
+        Serial.printf("Thresholds: %d, %d, %d, %d\n",
+          sensorThresholds[0], sensorThresholds[1], sensorThresholds[2], sensorThresholds[3]);
       }
     }
-    else if (command == "VOLUME_TOTAL") {
-      // פורמט: "VOLUME_TOTAL:75" - ערך 0-100
-      float vol = data.toFloat();
+    else if (strcmp(command, "VOLUME_TOTAL") == 0) {
+      float vol = atof(data);
       if (vol < 0) vol = 0;
       if (vol > 100) vol = 100;
       masterVol = vol / 100.0f;
       Serial.printf("Master Volume: %f\n", masterVol);
     }
-    else if (command == "MODE") {
-      int mode = data.toInt();
+    else if (strcmp(command, "MODE") == 0) {
+      int mode = atoi(data);
       prefs.putInt("mode", mode);  // persist to NVS — survives resets
       if (mode == 0) {
         audioMode = 0;
@@ -495,9 +570,9 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
         Serial.println("Mode: Song (saved, file will open on audio core)");
       }
     }
-    else if (command == "SENSITIVITY") {
+    else if (strcmp(command, "SENSITIVITY") == 0) {
       // Slider 0-100: 0=back sensitive, 50=balanced, 100=front sensitive
-      float s = data.toFloat();
+      float s = atof(data);
       if (s < 0) s = 0;
       if (s > 100) s = 100;
       float t = s / 100.0f;
@@ -510,15 +585,29 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
 };
 
 // ---------- BLE Notify Task (Core 0) ----------
-// Runs on the same core as BLE stack — eliminates cross-core mutex contention.
-// loop() on Core 1 just writes blePayload + sets flag, this task does the actual notify.
-// MUST be created AFTER BLEDevice::init() to avoid conflicting with BLE controller startup.
+// FIX #5: Added heartbeat watchdog.
+// If loop() hasn't updated blePayload in >2 seconds (Core 1 starved),
+// this task sends a minimal heartbeat to keep the BLE connection alive.
+// Without this, the phone/browser's GATT layer may decide the device is dead.
 void bleNotifyTask(void *parameter) {
   while (true) {
-    if (bleNeedsSend && deviceConnected && pSensorCharacteristic != NULL) {
-      pSensorCharacteristic->setValue(blePayload);
-      pSensorCharacteristic->notify();
-      bleNeedsSend = false;
+    if (deviceConnected && pSensorCharacteristic != NULL) {
+      if (bleNeedsSend) {
+        // Normal path: loop() prepared fresh data
+        pSensorCharacteristic->setValue(blePayload);
+        pSensorCharacteristic->notify();
+        bleNeedsSend = false;
+      } else {
+        // FIX #5: Heartbeat — if loop() hasn't sent data in >2s, send keepalive
+        unsigned long now = millis();
+        if (lastBleUpdateMs > 0 && (now - lastBleUpdateMs) > BLE_HEARTBEAT_TIMEOUT_MS) {
+          // Send minimal heartbeat so BLE connection stays alive
+          pSensorCharacteristic->setValue("{\"hb\":1}");
+          pSensorCharacteristic->notify();
+          lastBleUpdateMs = now;  // reset timer
+          Serial.println("BLE heartbeat sent (loop stalled)");
+        }
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(20));  // check every 20ms
   }
@@ -527,7 +616,7 @@ void bleNotifyTask(void *parameter) {
 void setup() {
   Serial.begin(115200);
   pinMode(ledPin, OUTPUT);
-  
+
   // Initialize sensor pins
   analogReadResolution(12); // Ensure we use 12-bit resolution matching new sketch
   for(int i = 0; i < numSensors; i++) {
@@ -577,18 +666,19 @@ void setup() {
       .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(22050), // Matches typical WAV sample rate
       .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
       .gpio_cfg = {
-        .mclk = I2S_GPIO_UNUSED, 
-        .bclk = I2S_BCLK_PIN, 
-        .ws = I2S_WS_PIN, 
-        .dout = I2S_DOUT_PIN, 
+        .mclk = I2S_GPIO_UNUSED,
+        .bclk = I2S_BCLK_PIN,
+        .ws = I2S_WS_PIN,
+        .dout = I2S_DOUT_PIN,
         .din = I2S_GPIO_UNUSED
       }
   };
   i2s_channel_init_std_mode(tx_handle, &std_cfg);
-  
+
   // Audio on Core 1 (same core as Arduino loop) — frees Core 0 for BLE stack
   // Priority 3 > loop's 1, so audio gets CPU when needed but yields on I2S DMA block
-  xTaskCreatePinnedToCore(audioTask, "AudioTask", 16384, NULL, 3, NULL, 1);
+  // FIX: Increased stack to 20480 for larger buffers
+  xTaskCreatePinnedToCore(audioTask, "AudioTask", 20480, NULL, 3, NULL, 1);
   Serial.println("Audio Task Started.");
 
   // ---------- BLE Init ----------
@@ -628,7 +718,7 @@ void setup() {
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->setScanResponse(false);
-  pAdvertising->setMinPreferred(0x0);  
+  pAdvertising->setMinPreferred(0x0);
   BLEDevice::startAdvertising();
   Serial.println("Waiting a client connection to notify...");
 
@@ -731,12 +821,14 @@ void loop() {
       timestamp,
       sensorValues[0], sensorValues[1], sensorValues[2], sensorValues[3]);
     bleNeedsSend = true;  // signal Core 0 task to send
+    lastBleUpdateMs = millis();  // FIX #5: track last update time for heartbeat
   }
 
   // BLE Maintenance
   if (!deviceConnected && oldDeviceConnected) {
     Serial.println("Device disconnected.");
     bleNeedsSend = false;  // clear flag so loop can write fresh data on reconnect
+    lastBleUpdateMs = 0;   // FIX #5: reset heartbeat timer
     delay(500);
     pServer->startAdvertising();
     Serial.println("Start advertising");
@@ -745,14 +837,21 @@ void loop() {
 
   if (deviceConnected && !oldDeviceConnected) {
     oldDeviceConnected = deviceConnected;
+    lastBleUpdateMs = millis();  // FIX #5: init heartbeat timer on connect
     Serial.println("Device Connected");
   }
 
   // Heap monitoring (every ~5 seconds)
+  // FIX #6: More detailed logging + warning threshold
   static unsigned long lastHeapLog = 0;
   if (millis() - lastHeapLog > 5000) {
     lastHeapLog = millis();
-    Serial.printf("Free heap: %d  Min: %d\n", ESP.getFreeHeap(), ESP.getMinFreeHeap());
+    uint32_t freeHeap = ESP.getFreeHeap();
+    uint32_t minHeap = ESP.getMinFreeHeap();
+    Serial.printf("Free heap: %d  Min: %d  Mode: %d\n", freeHeap, minHeap, audioMode);
+    if (freeHeap < HEAP_LOW_THRESHOLD) {
+      Serial.println("WARNING: Heap critically low! BLE may disconnect.");
+    }
   }
 
   delay(50);
