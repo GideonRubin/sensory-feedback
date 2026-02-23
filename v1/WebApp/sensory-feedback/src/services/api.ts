@@ -24,7 +24,24 @@ export const BleEndpoints = {
   SENSOR_VOLUME: 'SENSOR_VOLUME',
   MODE: 'MODE',
   SENSITIVITY: 'SENSITIVITY',
+  GETLOG: 'GETLOG',
 } as const;
+
+// ---------- Diagnostic Log ----------
+// Collected from ESP32 via GETLOG command after reconnection.
+// Events stored in ring buffer on ESP32 survive BLE disconnects.
+export interface DiagnosticEvent {
+  index: number;
+  timestamp: number;  // millis() on ESP32
+  event: string;      // e.g. "BLE_DISC", "HEAP_LOW", "SD_SLOW"
+  value: number;
+}
+
+type DiagLogCallback = (events: DiagnosticEvent[]) => void;
+let diagLogBuffer: DiagnosticEvent[] = [];
+let diagLogExpectedCount = 0;
+let diagLogCallbacks: DiagLogCallback[] = [];
+let diagLogCollecting = false;
 
 // Helper class for simulation state
 class SensorSimulator {
@@ -108,6 +125,28 @@ export const EspApi = {
             // These keep BLE alive but contain no sensor data
             if (parsed.hb !== undefined) {
                 console.debug('BLE heartbeat received');
+                return;
+            }
+            // Diagnostic log messages from GETLOG command
+            if (parsed.log !== undefined) {
+                if (parsed.log === 'start') {
+                    diagLogBuffer = [];
+                    diagLogExpectedCount = parsed.n || 0;
+                    diagLogCollecting = true;
+                    console.log(`[DiagLog] Receiving ${diagLogExpectedCount} events...`);
+                } else if (parsed.log === 'evt' && diagLogCollecting) {
+                    diagLogBuffer.push({
+                        index: parsed.i,
+                        timestamp: parsed.t,
+                        event: parsed.e,
+                        value: parsed.v,
+                    });
+                } else if (parsed.log === 'end') {
+                    diagLogCollecting = false;
+                    console.log(`[DiagLog] Received ${diagLogBuffer.length} events`);
+                    console.table(diagLogBuffer);
+                    diagLogCallbacks.forEach(cb => cb([...diagLogBuffer]));
+                }
                 return;
             }
             // Compact format: {"t":millis,"s":[val0,val1,val2,val3]}
@@ -240,6 +279,40 @@ export const EspApi = {
   setSensorVolume: (id: number, volume: number): void => {
     const data = `${id},${volume}`;
     EspApi.write(BleEndpoints.SENSOR_VOLUME, data);
+  },
+
+  // ---------- Diagnostic Log ----------
+  // Request the ESP32 to send its event log (ring buffer of last 64 events).
+  // Events include: BLE disconnects, heap warnings, SD read slowdowns, loop stalls.
+  // Returns a Promise that resolves with the log entries.
+  requestDiagLog: (): Promise<DiagnosticEvent[]> => {
+    return new Promise((resolve) => {
+      // Register one-time callback
+      const handler: DiagLogCallback = (events) => {
+        diagLogCallbacks = diagLogCallbacks.filter(cb => cb !== handler);
+        resolve(events);
+      };
+      diagLogCallbacks.push(handler);
+
+      // Timeout: if no response in 10s, resolve with whatever we have
+      setTimeout(() => {
+        diagLogCallbacks = diagLogCallbacks.filter(cb => cb !== handler);
+        resolve([...diagLogBuffer]);
+      }, 10000);
+
+      // Send GETLOG command
+      EspApi.write(BleEndpoints.GETLOG, '1');
+    });
+  },
+
+  // Subscribe to diagnostic log updates (called each time a log is received)
+  onDiagLog: (callback: DiagLogCallback): void => {
+    diagLogCallbacks.push(callback);
+  },
+
+  // Get last received diagnostic log without requesting new one
+  getLastDiagLog: (): DiagnosticEvent[] => {
+    return [...diagLogBuffer];
   },
 
   calibrateSensors: async () => {

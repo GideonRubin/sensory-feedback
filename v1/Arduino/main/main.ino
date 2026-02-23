@@ -155,6 +155,50 @@ bool oldDeviceConnected = false;
 // FIX #6: Heap safety threshold
 #define HEAP_LOW_THRESHOLD 30000  // 30KB — below this, throttle audio to free CPU
 
+// ---------- Diagnostic Event Log (Ring Buffer) ----------
+// Survives BLE disconnects (stored in RAM). Retrieved via "GETLOG" command
+// after reconnection to diagnose what happened while disconnected.
+// Each entry: 8 bytes. 64 entries = 512 bytes total — negligible RAM cost.
+enum EventType : uint8_t {
+  EVT_BOOT          = 0,   // System boot (value = restored audio mode)
+  EVT_BLE_CONNECT   = 1,   // BLE client connected
+  EVT_BLE_DISCONNECT = 2,  // BLE client disconnected
+  EVT_HEAP_LOW      = 3,   // Heap below threshold (value = free heap in KB)
+  EVT_HEARTBEAT     = 4,   // Heartbeat sent because loop() stalled
+  EVT_LOOP_SLOW     = 5,   // loop() took too long (value = gap in ms)
+  EVT_SD_READ_SLOW  = 6,   // SD card read took long (value = ms)
+  EVT_MODE_CHANGE   = 7,   // Audio mode changed (value = new mode)
+  EVT_SD_REWIND     = 8,   // Song file rewound to start
+  EVT_SD_FAIL       = 9,   // SD read returned 0 bytes
+  EVT_HEAP_SAMPLE   = 10,  // Periodic heap snapshot (value = free heap in KB)
+};
+
+struct LogEntry {
+  uint32_t timestamp;  // millis()
+  uint8_t  event;      // EventType
+  uint16_t value;      // context-dependent value
+  uint8_t  _pad;       // align to 8 bytes
+};
+
+#define LOG_SIZE 64
+LogEntry eventLog[LOG_SIZE];
+volatile int logHead = 0;   // next write position
+volatile int logCount = 0;  // total entries (capped at LOG_SIZE)
+
+void logEvent(EventType evt, uint16_t value = 0) {
+  eventLog[logHead].timestamp = millis();
+  eventLog[logHead].event = evt;
+  eventLog[logHead].value = value;
+  logHead = (logHead + 1) % LOG_SIZE;
+  if (logCount < LOG_SIZE) logCount++;
+}
+
+// Flag: BLE callback sets this, bleNotifyTask sends log entries on Core 0
+volatile bool needSendLog = false;
+
+// Track loop() timing for stall detection
+volatile unsigned long lastLoopMs = 0;
+
 // ---------- Wavetable Generation ----------
 void generateAccordionWavetable() {
   // Warmer accordion timbre: strong fundamental, gentle harmonic rolloff
@@ -288,7 +332,15 @@ void audioTask(void *parameter) {
       } else {
         // First iteration or after seek — must read synchronously
         songBuf = songBufA;
+        unsigned long sdStart = millis();
         bytesRead = songFile.read((uint8_t*)songBuf, bufSize);
+        unsigned long sdElapsed = millis() - sdStart;
+        if (sdElapsed > 50) {
+          logEvent(EVT_SD_READ_SLOW, (uint16_t)sdElapsed);
+        }
+        if (bytesRead == 0 && songFileOpen) {
+          logEvent(EVT_SD_FAIL);
+        }
       }
 
       // FIX #3: Yield after SD read to let loop() run (longer yield in song mode)
@@ -298,6 +350,7 @@ void audioTask(void *parameter) {
         // At song end: pad with silence, rewind for next cycle
         memset((uint8_t*)songBuf + bytesRead, 0, bufSize - bytesRead);
         songFile.seek(WAV_HEADER_SIZE);
+        logEvent(EVT_SD_REWIND);
       }
 
       float mv = masterVol;
@@ -440,6 +493,7 @@ void audioTask(void *parameter) {
 class MyServerCallbacks: public BLEServerCallbacks {
   void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) {
     deviceConnected = true;
+    logEvent(EVT_BLE_CONNECT);
     // Increase supervision timeout for range tolerance (walk around room)
     // Default ~200ms is too aggressive — BLE drops on 2-3 meter distance.
     // 4-second timeout lets the radio recover from brief obstructions.
@@ -454,6 +508,7 @@ class MyServerCallbacks: public BLEServerCallbacks {
 
   void onDisconnect(BLEServer* pServer) {
     deviceConnected = false;
+    logEvent(EVT_BLE_DISCONNECT);
   }
 };
 
@@ -558,6 +613,7 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
           voices[i].phaseInc2 = (freq * dr * WAVETABLE_SIZE) / (float)SAMPLE_RATE;
           voices[i].targetVol = 0.0f;
         }
+        logEvent(EVT_MODE_CHANGE, 0);
         Serial.println("Mode: Accordion (saved)");
       } else if (mode == 1) {
         // Song mode: silence all accordion voices
@@ -567,8 +623,15 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
         resetFilterState();
         needOpenSong = true;  // Audio task will open file on Core 1
         audioMode = 1;
+        logEvent(EVT_MODE_CHANGE, 1);
         Serial.println("Mode: Song (saved, file will open on audio core)");
       }
+    }
+    else if (strcmp(command, "GETLOG") == 0) {
+      // Send diagnostic log via BLE notifications.
+      // bleNotifyTask on Core 0 will handle the actual sending.
+      needSendLog = true;
+      Serial.printf("GETLOG requested (%d entries)\n", logCount);
     }
     else if (strcmp(command, "SENSITIVITY") == 0) {
       // Slider 0-100: 0=back sensitive, 50=balanced, 100=front sensitive
@@ -589,9 +652,56 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
 // If loop() hasn't updated blePayload in >2 seconds (Core 1 starved),
 // this task sends a minimal heartbeat to keep the BLE connection alive.
 // Without this, the phone/browser's GATT layer may decide the device is dead.
+// Event type names for log output (compact, fits in BLE MTU)
+static const char* evtNames[] = {
+  "BOOT", "BLE_CONN", "BLE_DISC", "HEAP_LOW", "HEARTBEAT",
+  "LOOP_SLOW", "SD_SLOW", "MODE_CHG", "SD_REWIND", "SD_FAIL", "HEAP_SNAP"
+};
+
 void bleNotifyTask(void *parameter) {
   while (true) {
     if (deviceConnected && pSensorCharacteristic != NULL) {
+
+      // --- Send diagnostic log if requested ---
+      if (needSendLog) {
+        needSendLog = false;
+        int count = logCount;
+        int start = (count < LOG_SIZE) ? 0 : logHead;  // oldest entry
+
+        // Send header: {"log":"start","n":count}
+        char hdr[60];
+        snprintf(hdr, sizeof(hdr), "{\"log\":\"start\",\"n\":%d}", count);
+        pSensorCharacteristic->setValue(hdr);
+        pSensorCharacteristic->notify();
+        vTaskDelay(pdMS_TO_TICKS(30));  // pace notifications
+
+        for (int i = 0; i < count; i++) {
+          int idx = (start + i) % LOG_SIZE;
+          LogEntry &e = eventLog[idx];
+          const char *name = (e.event < sizeof(evtNames)/sizeof(evtNames[0]))
+                             ? evtNames[e.event] : "?";
+          char line[80];
+          snprintf(line, sizeof(line), "{\"log\":\"evt\",\"i\":%d,\"t\":%lu,\"e\":\"%s\",\"v\":%u}",
+                   i, e.timestamp, name, e.value);
+          pSensorCharacteristic->setValue(line);
+          pSensorCharacteristic->notify();
+          vTaskDelay(pdMS_TO_TICKS(30));  // pace: ~33 notifications/sec max
+
+          // If disconnected mid-send, abort
+          if (!deviceConnected) break;
+        }
+
+        // Send footer: {"log":"end"}
+        if (deviceConnected) {
+          pSensorCharacteristic->setValue("{\"log\":\"end\"}");
+          pSensorCharacteristic->notify();
+        }
+        Serial.printf("Log sent: %d entries\n", count);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        continue;  // skip normal notify this cycle
+      }
+
+      // --- Normal sensor notification path ---
       if (bleNeedsSend) {
         // Normal path: loop() prepared fresh data
         pSensorCharacteristic->setValue(blePayload);
@@ -605,6 +715,7 @@ void bleNotifyTask(void *parameter) {
           pSensorCharacteristic->setValue("{\"hb\":1}");
           pSensorCharacteristic->notify();
           lastBleUpdateMs = now;  // reset timer
+          logEvent(EVT_HEARTBEAT);
           Serial.println("BLE heartbeat sent (loop stalled)");
         }
       }
@@ -723,9 +834,13 @@ void setup() {
   Serial.println("Waiting a client connection to notify...");
 
   // BLE notify on Core 0 (same core as BLE stack) — AFTER BLE init to avoid conflicts
-  // Stack 4096: setValue + notify do internal heap allocations
-  xTaskCreatePinnedToCore(bleNotifyTask, "BLENotify", 4096, NULL, 2, NULL, 0);
+  // Stack increased to 6144 for log sending (snprintf + notify per entry)
+  xTaskCreatePinnedToCore(bleNotifyTask, "BLENotify", 6144, NULL, 2, NULL, 0);
   Serial.println("BLE Notify Task Started.");
+
+  // Log boot event with restored mode
+  logEvent(EVT_BOOT, (uint16_t)audioMode);
+  lastLoopMs = millis();
 }
 
 void loop() {
@@ -813,6 +928,14 @@ void loop() {
     bassLvlR = BASS_BASE;     bassLvlL = BASS_BASE;
   }
 
+  // ---- Loop stall detection ----
+  // If loop() hasn't run in >200ms, something starved it (audio task or SD)
+  unsigned long loopGap = timestamp - lastLoopMs;
+  if (lastLoopMs > 0 && loopGap > 200) {
+    logEvent(EVT_LOOP_SLOW, (uint16_t)min(loopGap, (unsigned long)65535));
+  }
+  lastLoopMs = timestamp;
+
   // ---- BLE Logic ----
   // Write sensor data to shared buffer; Core 0 bleNotifyTask does the actual BLE send.
   // This prevents loop() from holding BLE mutex while audio task preempts it.
@@ -849,7 +972,10 @@ void loop() {
     uint32_t freeHeap = ESP.getFreeHeap();
     uint32_t minHeap = ESP.getMinFreeHeap();
     Serial.printf("Free heap: %d  Min: %d  Mode: %d\n", freeHeap, minHeap, audioMode);
+    // Log heap snapshot every 5s (value = KB free)
+    logEvent(EVT_HEAP_SAMPLE, (uint16_t)(freeHeap / 1024));
     if (freeHeap < HEAP_LOW_THRESHOLD) {
+      logEvent(EVT_HEAP_LOW, (uint16_t)(freeHeap / 1024));
       Serial.println("WARNING: Heap critically low! BLE may disconnect.");
     }
   }

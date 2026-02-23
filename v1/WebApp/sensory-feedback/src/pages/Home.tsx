@@ -1,10 +1,10 @@
 import { useState, useEffect, useRef } from 'react'
 import { EspApi } from '../services/api'
+import type { AudioMode, DiagnosticEvent } from '../services/api'
 import { useConnection } from '@/context/ConnectionContext'
 import { Switch } from '@/components/ui/switch'
 import { Slider } from '@/components/ui/slider'
-import { Power, Volume2, XCircle, CheckCircle2, Music, AudioWaveform, Footprints, Loader2 } from 'lucide-react'
-import type { AudioMode } from '../services/api'
+import { Power, Volume2, XCircle, CheckCircle2, Music, AudioWaveform, Footprints, Loader2, ClipboardList, X, AlertTriangle, Wifi, WifiOff, Activity, HardDrive, Heart, Timer, RotateCcw, Cpu, Zap } from 'lucide-react'
 
 interface Notification {
   message: string;
@@ -18,6 +18,9 @@ export function Home() {
   const [audioMode, setAudioMode] = useState<AudioMode>(0)
   const [sensitivity, setSensitivity] = useState([75]) // 0=back, 50=balanced, 100=front
   const [notification, setNotification] = useState<Notification | null>(null)
+  const [showDiagLog, setShowDiagLog] = useState(false)
+  const [diagEvents, setDiagEvents] = useState<DiagnosticEvent[]>([])
+  const [diagLoading, setDiagLoading] = useState(false)
   const prevConnected = useRef(false)
   const prevReconnecting = useRef(false)
 
@@ -53,6 +56,8 @@ export function Home() {
       // Reconnect just finished successfully — re-send mode, volume, etc.
       syncStateToDevice();
       showNotification('Reconnected', 'success');
+      // Auto-fetch diagnostic log after reconnect to see what happened
+      handleRequestDiagLog(true);
     }
     prevReconnecting.current = isReconnecting;
   }, [isReconnecting, isConnected]);
@@ -132,6 +137,83 @@ export function Home() {
     setSensitivity(value);
     if (!isConnected) return;
     EspApi.setSensitivity(value[0]);
+  }
+
+  // Request diagnostic log from ESP32
+  const handleRequestDiagLog = async (silent = false) => {
+    if (!isConnected) return;
+    setDiagLoading(true);
+    try {
+      const events = await EspApi.requestDiagLog();
+      setDiagEvents(events);
+      if (!silent) {
+        setShowDiagLog(true);
+      } else if (events.some(e => e.event === 'BLE_DISC' || e.event === 'HEAP_LOW' || e.event === 'LOOP_SLOW')) {
+        // Auto-show only if there are interesting events after reconnect
+        setShowDiagLog(true);
+      }
+    } catch (error) {
+      console.error('Failed to get diagnostic log:', error);
+    } finally {
+      setDiagLoading(false);
+    }
+  }
+
+  // Format millis timestamp to readable relative time
+  const formatTimestamp = (ms: number): string => {
+    const sec = Math.floor(ms / 1000);
+    const min = Math.floor(sec / 60);
+    const s = sec % 60;
+    if (min > 0) return `${min}m ${s}s`;
+    return `${s}s`;
+  }
+
+  // Get icon and color for each event type
+  const getEventStyle = (event: string): { icon: React.ReactNode; color: string; bg: string } => {
+    switch (event) {
+      case 'BLE_DISC':
+        return { icon: <WifiOff className="w-3.5 h-3.5" />, color: 'text-red-600', bg: 'bg-red-50' };
+      case 'BLE_CONN':
+        return { icon: <Wifi className="w-3.5 h-3.5" />, color: 'text-emerald-600', bg: 'bg-emerald-50' };
+      case 'HEAP_LOW':
+        return { icon: <AlertTriangle className="w-3.5 h-3.5" />, color: 'text-amber-600', bg: 'bg-amber-50' };
+      case 'HEARTBEAT':
+        return { icon: <Heart className="w-3.5 h-3.5" />, color: 'text-rose-500', bg: 'bg-rose-50' };
+      case 'LOOP_SLOW':
+        return { icon: <Timer className="w-3.5 h-3.5" />, color: 'text-orange-600', bg: 'bg-orange-50' };
+      case 'SD_SLOW':
+        return { icon: <HardDrive className="w-3.5 h-3.5" />, color: 'text-orange-500', bg: 'bg-orange-50' };
+      case 'SD_REWIND':
+        return { icon: <RotateCcw className="w-3.5 h-3.5" />, color: 'text-slate-400', bg: 'bg-slate-50' };
+      case 'SD_FAIL':
+        return { icon: <HardDrive className="w-3.5 h-3.5" />, color: 'text-red-500', bg: 'bg-red-50' };
+      case 'MODE_CHG':
+        return { icon: <Music className="w-3.5 h-3.5" />, color: 'text-blue-500', bg: 'bg-blue-50' };
+      case 'BOOT':
+        return { icon: <Zap className="w-3.5 h-3.5" />, color: 'text-purple-500', bg: 'bg-purple-50' };
+      case 'HEAP_SNAP':
+        return { icon: <Cpu className="w-3.5 h-3.5" />, color: 'text-slate-400', bg: 'bg-slate-50' };
+      default:
+        return { icon: <Activity className="w-3.5 h-3.5" />, color: 'text-slate-500', bg: 'bg-slate-50' };
+    }
+  }
+
+  // Get human-readable description for event
+  const getEventDescription = (event: string, value: number): string => {
+    switch (event) {
+      case 'BLE_DISC': return 'BLE Disconnected';
+      case 'BLE_CONN': return 'BLE Connected';
+      case 'HEAP_LOW': return `Heap Low: ${value}KB free`;
+      case 'HEARTBEAT': return 'Heartbeat (loop stalled)';
+      case 'LOOP_SLOW': return `Loop stalled: ${value}ms gap`;
+      case 'SD_SLOW': return `SD read slow: ${value}ms`;
+      case 'SD_REWIND': return 'Song restarted';
+      case 'SD_FAIL': return 'SD read failed (0 bytes)';
+      case 'MODE_CHG': return value === 1 ? 'Mode → Song' : 'Mode → Accordion';
+      case 'BOOT': return `Boot (mode: ${value === 1 ? 'Song' : 'Accordion'})`;
+      case 'HEAP_SNAP': return `Heap: ${value}KB free`;
+      default: return `${event} (${value})`;
+    }
   }
 
   return (
@@ -237,6 +319,16 @@ export function Home() {
                   <span>Front</span>
                 </div>
               </div>
+
+              {/* Diagnostic Log Button */}
+              <button
+                onClick={() => handleRequestDiagLog(false)}
+                disabled={diagLoading}
+                className="flex items-center gap-2 px-4 py-2 rounded-full text-xs font-medium text-slate-400 hover:text-slate-600 hover:bg-slate-50 transition-all duration-200 animate-in fade-in duration-700 delay-200 fill-mode-both"
+              >
+                {diagLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ClipboardList className="w-3.5 h-3.5" />}
+                Diagnostic Log
+              </button>
             </>
         )}
       </div>
@@ -253,6 +345,62 @@ export function Home() {
           </span>
       </div>
 
+      {/* Diagnostic Log Modal */}
+      {showDiagLog && (
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/30 backdrop-blur-sm" onClick={() => setShowDiagLog(false)}>
+          <div
+            className="w-full max-w-md bg-white rounded-t-3xl shadow-2xl max-h-[75vh] flex flex-col animate-in slide-in-from-bottom duration-300"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <div className="flex items-center justify-between px-6 pt-5 pb-3 border-b border-slate-100">
+              <div className="flex items-center gap-2">
+                <ClipboardList className="w-4 h-4 text-slate-500" />
+                <span className="text-sm font-semibold text-slate-700">Diagnostic Log</span>
+                <span className="text-[10px] font-medium text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">{diagEvents.length} events</span>
+              </div>
+              <button onClick={() => setShowDiagLog(false)} className="p-1 rounded-full hover:bg-slate-100 transition-colors">
+                <X className="w-4 h-4 text-slate-400" />
+              </button>
+            </div>
+
+            {/* Event List */}
+            <div className="flex-1 overflow-y-auto px-4 py-3 space-y-1.5">
+              {diagEvents.length === 0 ? (
+                <div className="flex flex-col items-center justify-center py-10 text-slate-300">
+                  <Activity className="w-8 h-8 mb-2" />
+                  <span className="text-sm font-medium">No events recorded</span>
+                </div>
+              ) : (
+                diagEvents.map((evt, i) => {
+                  const style = getEventStyle(evt.event);
+                  return (
+                    <div key={i} className={`flex items-center gap-3 px-3 py-2 rounded-xl ${style.bg}`}>
+                      <div className={`flex-shrink-0 ${style.color}`}>{style.icon}</div>
+                      <div className="flex-1 min-w-0">
+                        <span className={`text-xs font-medium ${style.color}`}>{getEventDescription(evt.event, evt.value)}</span>
+                      </div>
+                      <span className="text-[10px] font-mono text-slate-400 flex-shrink-0">{formatTimestamp(evt.timestamp)}</span>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            {/* Refresh Button */}
+            <div className="px-6 py-3 border-t border-slate-100">
+              <button
+                onClick={() => handleRequestDiagLog(false)}
+                disabled={diagLoading}
+                className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-600 text-xs font-medium transition-colors"
+              >
+                {diagLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
+                Refresh
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
