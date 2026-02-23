@@ -11,28 +11,48 @@ interface Notification {
   type: 'success' | 'error';
 }
 
+// Persist UI state across page navigations
+const STORAGE_KEY = 'tom-ui-state';
+function loadState<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return fallback;
+    const obj = JSON.parse(raw);
+    return obj[key] !== undefined ? obj[key] : fallback;
+  } catch { return fallback; }
+}
+function saveState(key: string, value: unknown) {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    const obj = raw ? JSON.parse(raw) : {};
+    obj[key] = value;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(obj));
+  } catch { /* ignore */ }
+}
+
 export function Home() {
   const { isConnected, isReconnecting, connect, disconnect } = useConnection()
-  const [ledState, setLedState] = useState(true)
-  const [volume, setVolume] = useState([100]) // Default volume 100
-  const [audioMode, setAudioMode] = useState<AudioMode>(0)
-  const [sensitivity, setSensitivity] = useState([75]) // 0=back, 50=balanced, 100=front
+  const [ledState, setLedState] = useState(() => loadState('ledState', true))
+  const [volume, setVolume] = useState(() => [loadState('volume', 100)])
+  const [audioMode, setAudioMode] = useState<AudioMode>(() => loadState('audioMode', 0) as AudioMode)
+  const [sensitivity, setSensitivity] = useState(() => [loadState('sensitivity', 75)])
   const [notification, setNotification] = useState<Notification | null>(null)
   const [showDiagLog, setShowDiagLog] = useState(false)
   const [diagEvents, setDiagEvents] = useState<DiagnosticEvent[]>([])
   const [diagLoading, setDiagLoading] = useState(false)
-  const prevConnected = useRef(false)
-  const prevReconnecting = useRef(false)
+  // Initialize refs with CURRENT value so re-mount while connected doesn't trigger sync
+  const prevConnected = useRef(isConnected)
+  const prevReconnecting = useRef(isReconnecting)
 
   // Refs that always hold the latest state — immune to stale closures
   const audioModeRef = useRef<AudioMode>(audioMode)
   const volumeRef = useRef(volume)
   const sensitivityRef = useRef(sensitivity)
   const ledStateRef = useRef(ledState)
-  useEffect(() => { audioModeRef.current = audioMode }, [audioMode])
-  useEffect(() => { volumeRef.current = volume }, [volume])
-  useEffect(() => { sensitivityRef.current = sensitivity }, [sensitivity])
-  useEffect(() => { ledStateRef.current = ledState }, [ledState])
+  useEffect(() => { audioModeRef.current = audioMode; saveState('audioMode', audioMode) }, [audioMode])
+  useEffect(() => { volumeRef.current = volume; saveState('volume', volume[0]) }, [volume])
+  useEffect(() => { sensitivityRef.current = sensitivity; saveState('sensitivity', sensitivity[0]) }, [sensitivity])
+  useEffect(() => { ledStateRef.current = ledState; saveState('ledState', ledState) }, [ledState])
 
   useEffect(() => {
     if (notification) {
@@ -41,7 +61,8 @@ export function Home() {
     }
   }, [notification]);
 
-  // Re-sync state to ESP32 on first connect (user toggled on)
+  // Re-sync state to ESP32 on fresh connect (user toggled switch on)
+  // prevConnected starts as current isConnected, so re-mount while connected won't trigger
   useEffect(() => {
     if (isConnected && !prevConnected.current) {
       syncStateToDevice();
