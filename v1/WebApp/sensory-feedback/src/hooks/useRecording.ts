@@ -3,70 +3,50 @@ import { saveRecording } from '@/services/db';
 
 export function useRecording() {
   const [isRecording, setIsRecording] = useState(false);
-  const [recordingStartTime, setRecordingStartTime] = useState<number | null>(null);
   const [recordingDuration, setRecordingDuration] = useState(0);
   const recordedDataRef = useRef<{ time: number; values: number[] }[]>([]);
   const frameCounterRef = useRef(0);
+  // Use ref for start time to avoid stale closure issues in setInterval
+  const startTimeRef = useRef<number | null>(null);
 
-  // Manage recording timer
+  // Manage recording timer — ref-based to avoid closure staleness
   useEffect(() => {
-    // Only lock scroll when recording? The original locked it always when mounted?
-    // The original code:
-    /*
-      useEffect(() => {
-        document.body.style.overflow = 'hidden';
-        let recordingInterval...
-        // ...
-        return () => {
-             document.body.style.overflow = '';
-             clearInterval(recordingInterval);
-        };
-      }, [isRecording, recordingStartTime]);
-    */
-    // It seems it locked scroll only when the effect ran? No, useEffect runs on mount too.
-    // Wait, the dependency array [isRecording, recordingStartTime] means it re-runs regularly.
-    // If isRecording is false at start, scroll is hidden? Yes.
-    // Then on clean up (unmount or change), it restores scroll.
-    // I should probably check if I should keep the scroll locking behavior here or in the component.
-    // The component is likely the best place for UI side effects like scroll locking.
-    // I'll leave scroll locking out of the hook for now, or put it in the UI component.
-    
-    let recordingInterval: ReturnType<typeof setInterval>;
-
-    if (isRecording && recordingStartTime) {
-      recordingInterval = setInterval(() => {
-        setRecordingDuration(Math.floor((Date.now() - recordingStartTime) / 1000));
-      }, 1000);
-    } else {
+    if (!isRecording) {
       setRecordingDuration(0);
+      return;
     }
 
-    return () => {
-        clearInterval(recordingInterval);
-    };
-  }, [isRecording, recordingStartTime]);
+    // Tick immediately so timer shows 0:01 after 1 second
+    const interval = setInterval(() => {
+      if (startTimeRef.current != null) {
+        setRecordingDuration(Math.floor((Date.now() - startTimeRef.current) / 1000));
+      }
+    }, 500); // update every 500ms for snappier display
+
+    return () => clearInterval(interval);
+  }, [isRecording]);
 
   const captureFrame = useCallback((sensorData: number[]) => {
-      if (isRecording && recordingStartTime != null) {
+      if (isRecording && startTimeRef.current != null) {
             frameCounterRef.current = (frameCounterRef.current + 1) % 2;
-            
+
             if (frameCounterRef.current === 0) {
                  recordedDataRef.current.push({
-                    time: Date.now() - recordingStartTime,
+                    time: Date.now() - startTimeRef.current,
                     values: sensorData
                 });
             }
         } else {
-             frameCounterRef.current = 0; 
+             frameCounterRef.current = 0;
         }
-  }, [isRecording, recordingStartTime]);
+  }, [isRecording]);
 
   const toggleRecording = useCallback(async () => {
       if (isRecording) {
           // STOP RECORDING
           setIsRecording(false);
-          setRecordingStartTime(null);
-          
+          startTimeRef.current = null;
+
           try {
             // Generate CSV content
             // Sensor Order: 0:Right Front, 1:Left Front, 2:Right Back, 3:Left Back
@@ -102,8 +82,8 @@ export function useRecording() {
           recordedDataRef.current = [];
       } else {
           // START RECORDING
+          startTimeRef.current = Date.now();
           setIsRecording(true);
-          setRecordingStartTime(Date.now());
           recordedDataRef.current = [];
       }
   }, [isRecording, recordingDuration]);
