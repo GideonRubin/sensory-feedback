@@ -11,6 +11,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const result = await list({
       cursor: cursor as string | undefined,
       limit: 100,
+      token: process.env.BLOB_READ_WRITE_TOKEN,
     });
 
     return res.status(200).json(result);

@@ -1,15 +1,5 @@
 import { del } from '@vercel/blob';
-
-type VercelRequest = {
-  method?: string;
-  body?: unknown;
-};
-
-type VercelResponse = {
-  status: (code: number) => {
-    json: (body: unknown) => unknown;
-  };
-};
+import type { VercelRequest, VercelResponse } from '@vercel/node';
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'DELETE') {
@@ -23,7 +13,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ error: 'Missing blob URL' });
     }
 
-    await del(url);
+    await del(url, { token: process.env.BLOB_READ_WRITE_TOKEN });
 
     return res.status(200).json({ success: true });
   } catch (error) {

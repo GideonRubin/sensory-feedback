@@ -1,12 +1,14 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { VitePWA } from 'vite-plugin-pwa'
+import { apiBlobPlugin } from './src/plugins/apiBlobPlugin'
 import path from "path"
 
 
 export default defineConfig({
   plugins: [
     react(),
+    apiBlobPlugin(),
     VitePWA({
       registerType: 'autoUpdate',
       includeAssets: ['favicon.ico', 'apple-touch-icon.png', 'mask-icon.svg'],

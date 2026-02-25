@@ -16,6 +16,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const blob = await put(filename, data, {
       access: 'public',
       contentType: 'text/csv',
+      token: process.env.BLOB_READ_WRITE_TOKEN,
     });
 
     return res.status(200).json(blob);
