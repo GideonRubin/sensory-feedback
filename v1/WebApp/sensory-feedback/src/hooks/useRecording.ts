@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { saveRecording } from '@/services/db';
+import { saveRecording } from '@/services/blobService';
 
 export function useRecording() {
   const [isRecording, setIsRecording] = useState(false);
@@ -56,9 +56,9 @@ export function useRecording() {
             ).join('\n');
             const csvContent = headers + rows;
 
-            // Save to IndexedDB
+            // Save to Vercel Blob cloud storage
             await saveRecording(recordingDuration, csvContent);
-            console.log("Recording saved to DB successfully");
+            console.log("Recording saved to cloud successfully");
             
             // Optional: Still allow download? For now, we just save to DB as requested.
             // If you want download + DB, uncomment this section:

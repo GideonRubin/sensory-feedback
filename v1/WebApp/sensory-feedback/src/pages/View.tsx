@@ -1,61 +1,80 @@
 import { useEffect, useState } from 'react';
-import { getAllRecordings, deleteRecording, updateRecordingNotes } from '@/services/db';
-import { Download, Trash2, FileText, Play } from 'lucide-react';
+import { getAllRecordings, deleteRecording, updateRecordingNotes, downloadRecordingData, type CloudRecording } from '@/services/blobService';
+import { Download, Trash2, FileText, Play, Loader2 } from 'lucide-react';
 import { PlaybackModal } from '@/components/PlaybackModal';
 
-interface RecordingItem {
-    id?: number;
-    date: string;
-    duration: number;
-    data: string;
-    notes?: string;
-}
-
 export function View() {
-    const [recordings, setRecordings] = useState<RecordingItem[]>([]);
-    const [editingId, setEditingId] = useState<number | null>(null);
+    const [recordings, setRecordings] = useState<CloudRecording[]>([]);
+    const [loading, setLoading] = useState(true);
+    const [editingUrl, setEditingUrl] = useState<string | null>(null);
     const [editNote, setEditNote] = useState('');
     
     // Playback State
-    const [playbackRec, setPlaybackRec] = useState<RecordingItem | null>(null);
+    const [playbackRec, setPlaybackRec] = useState<{ date: string; data: string } | null>(null);
+    const [downloadingUrl, setDownloadingUrl] = useState<string | null>(null);
 
     useEffect(() => {
         loadRecordings();
     }, []);
 
     const loadRecordings = async () => {
-        const data = await getAllRecordings();
-        // Sort by date descending (newest first)
-        setRecordings(data.reverse());
+        setLoading(true);
+        try {
+            const data = await getAllRecordings();
+            setRecordings(data);
+        } catch (err) {
+            console.error('Failed to load recordings:', err);
+        } finally {
+            setLoading(false);
+        }
     };
 
-    const handleDownload = (rec: RecordingItem) => {
-        const blob = new Blob([rec.data], { type: 'text/csv' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `recording_${new Date(rec.date).toISOString()}.csv`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
+    const handlePlayback = async (rec: CloudRecording) => {
+        setDownloadingUrl(rec.url);
+        try {
+            const csvData = await downloadRecordingData(rec.url);
+            setPlaybackRec({ date: rec.date, data: csvData });
+        } catch (err) {
+            console.error('Failed to download recording:', err);
+            alert('Failed to load recording for playback');
+        } finally {
+            setDownloadingUrl(null);
+        }
     };
 
-    const handleDelete = async (id: number) => {
+    const handleDownload = async (rec: CloudRecording) => {
+        try {
+            const csvData = await downloadRecordingData(rec.url);
+            const blob = new Blob([csvData], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `recording_${new Date(rec.date).toISOString()}.csv`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        } catch (err) {
+            console.error('Download failed:', err);
+            alert('Failed to download recording');
+        }
+    };
+
+    const handleDelete = async (blobUrl: string) => {
         if(confirm('Are you sure you want to delete this recording?')) {
-            await deleteRecording(id);
+            await deleteRecording(blobUrl);
             loadRecordings();
         }
     };
 
-    const startEdit = (rec: RecordingItem) => {
-        setEditingId(rec.id!);
+    const startEdit = (rec: CloudRecording) => {
+        setEditingUrl(rec.url);
         setEditNote(rec.notes || '');
     };
 
-    const saveNote = async (id: number) => {
-        await updateRecordingNotes(id, editNote);
-        setEditingId(null);
+    const saveNote = async (blobUrl: string) => {
+        await updateRecordingNotes(blobUrl, editNote);
+        setEditingUrl(null);
         loadRecordings();
     };
 
@@ -70,7 +89,14 @@ export function View() {
             </div>
 
             <div className="flex-1 w-full max-w-md mx-auto px-4 overflow-y-auto no-scrollbar pb-24 space-y-3">
-                {recordings.length === 0 && (
+                {loading && (
+                    <div className="flex flex-col items-center justify-center py-20 text-slate-400 gap-2">
+                        <Loader2 size={32} className="animate-spin opacity-40" />
+                        <span className="text-sm font-medium">Loading from cloud...</span>
+                    </div>
+                )}
+
+                {!loading && recordings.length === 0 && (
                     <div className="flex flex-col items-center justify-center py-20 text-slate-400 gap-2">
                         <FileText size={48} className="opacity-20" />
                         <span className="text-sm font-medium">No recordings found</span>
@@ -78,24 +104,28 @@ export function View() {
                 )}
 
                 {recordings.map((rec, index) => (
-                    <div key={rec.id} className="group relative bg-white rounded-2xl p-5 shadow-[0_2px_8px_rgba(0,0,0,0.04)] hover:shadow-[0_8px_24px_rgba(0,0,0,0.08)] transition-all duration-300 border border-slate-100/50 hover:border-blue-500/20 active:scale-[0.99]">
+                    <div key={rec.url} className="group relative bg-white rounded-2xl p-5 shadow-[0_2px_8px_rgba(0,0,0,0.04)] hover:shadow-[0_8px_24px_rgba(0,0,0,0.08)] transition-all duration-300 border border-slate-100/50 hover:border-blue-500/20 active:scale-[0.99]">
                         <div className="flex justify-between items-start mb-4">
                             <div 
                                 className="cursor-pointer flex-1"
-                                onClick={() => setPlaybackRec(rec)} 
+                                onClick={() => handlePlayback(rec)} 
                             >
                                 <div className="flex items-center gap-4">
                                     <div className="w-12 h-12 rounded-2xl bg-blue-50 group-hover:bg-blue-600 transition-colors duration-300 flex items-center justify-center text-blue-600 group-hover:text-white shadow-sm group-hover:shadow-blue-500/30">
-                                       <Play size={20} fill="currentColor" className="ml-0.5 transition-transform group-hover:scale-110" />
+                                       {downloadingUrl === rec.url ? (
+                                           <Loader2 size={20} className="animate-spin" />
+                                       ) : (
+                                           <Play size={20} fill="currentColor" className="ml-0.5 transition-transform group-hover:scale-110" />
+                                       )}
                                     </div>
                                     <div className="text-left py-0.5">
                                         <div className="text-lg font-bold text-slate-800 leading-none mb-1.5 group-hover:text-blue-600 transition-colors">
                                             {index + 1}
                                         </div>
                                         <div className="text-[11px] font-semibold text-slate-400 uppercase tracking-wide flex items-center gap-1.5">
-                                            <span>{new Date(rec.date).toLocaleDateString(undefined, { month: 'numeric', day: 'numeric', year: 'numeric' })}</span>
+                                            <span>{new Date(rec.date || rec.uploadedAt).toLocaleDateString(undefined, { month: 'numeric', day: 'numeric', year: 'numeric' })}</span>
                                             <span className="w-0.5 h-0.5 rounded-full bg-slate-300" />
-                                            <span>{new Date(rec.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                                            <span>{new Date(rec.date || rec.uploadedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                                             <span className="w-0.5 h-0.5 rounded-full bg-slate-300" />
                                             <span className="text-slate-500">{formatDuration(rec.duration)}</span>
                                         </div>
@@ -112,7 +142,7 @@ export function View() {
                                     <Download size={18} />
                                 </button>
                                 <button 
-                                    onClick={(e) => { e.stopPropagation(); handleDelete(rec.id!); }}
+                                    onClick={(e) => { e.stopPropagation(); handleDelete(rec.url); }}
                                     className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
                                     title="Delete"
                                 >
@@ -123,7 +153,7 @@ export function View() {
 
                         {/* Notes Section */}
                         <div className="pl-[52px]">
-                            {editingId === rec.id ? (
+                            {editingUrl === rec.url ? (
                                 <div className="flex gap-2">
                                     <input 
                                         className="flex-1 text-sm bg-slate-50 border border-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all"
@@ -134,7 +164,7 @@ export function View() {
                                         onClick={(e) => e.stopPropagation()}
                                     />
                                     <button 
-                                        onClick={(e) => { e.stopPropagation(); saveNote(rec.id!); }}
+                                        onClick={(e) => { e.stopPropagation(); saveNote(rec.url); }}
                                         className="text-xs bg-slate-900 text-white px-3 rounded-lg font-medium hover:bg-slate-800 transition-colors"
                                     >
                                         Save
