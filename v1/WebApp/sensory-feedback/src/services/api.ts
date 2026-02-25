@@ -14,13 +14,34 @@ export interface Sensor {
 
 export type Sensors = Sensor[];
 
+export type AudioMode = 0 | 1;  // 0 = accordion, 1 = song + feedback
+
 export const BleEndpoints = {
   LED: 'LED',
   PING: 'PING',
   VOLUME_TOTAL: 'VOLUME_TOTAL',
   SENSOR_THRESHOLD: 'SENSOR_THRESHOLD',
   SENSOR_VOLUME: 'SENSOR_VOLUME',
+  MODE: 'MODE',
+  SENSITIVITY: 'SENSITIVITY',
+  GETLOG: 'GETLOG',
 } as const;
+
+// ---------- Diagnostic Log ----------
+// Collected from ESP32 via GETLOG command after reconnection.
+// Events stored in ring buffer on ESP32 survive BLE disconnects.
+export interface DiagnosticEvent {
+  index: number;
+  timestamp: number;  // millis() on ESP32
+  event: string;      // e.g. "BLE_DISC", "HEAP_LOW", "SD_SLOW"
+  value: number;
+}
+
+type DiagLogCallback = (events: DiagnosticEvent[]) => void;
+let diagLogBuffer: DiagnosticEvent[] = [];
+let diagLogExpectedCount = 0;
+let diagLogCallbacks: DiagLogCallback[] = [];
+let diagLogCollecting = false;
 
 // Helper class for simulation state
 class SensorSimulator {
@@ -80,24 +101,77 @@ class SensorSimulator {
 
 const simulator = new SensorSimulator(4);
 let latestSensorData: Sensors = [];
+// Raw normalized values (0-100) before calibration subtraction - used for calibration
+let latestRawNormalized: number[] = [0, 0, 0, 0];
+// Calibration baselines stored in normalized 0-100 range for display adjustment
+let calibrationBaselines: number[] = [0, 0, 0, 0];
 
 /**
  * Communication between ESP32 and WebApp
  */
 export const EspApi = {
+  onDisconnect: (callback: () => void): void => {
+    bleService.onDisconnect(callback);
+  },
+  onReconnect: (callback: (state: 'reconnecting' | 'reconnected' | 'failed') => void): void => {
+    bleService.onReconnect(callback);
+  },
   connect: async (): Promise<void> => {
     await bleService.connect();
     bleService.subscribeToSensor((jsonString) => {
         try {
             const parsed = JSON.parse(jsonString);
-            latestSensorData = parsed.map((item: any) => ({
-                id: item.id,
-                data: item.data.map((d: any) => ({
-                    time: new Date(),
-                    // Normalize 12-bit ADC (0-4095) to 0-100 range
-                    amplitude: Math.min(100, (Number(d.amplitude) / 4095) * 100)
-                }))
-            }));
+            // FIX: Ignore heartbeat messages from ESP32 (sent when loop() is stalled)
+            // These keep BLE alive but contain no sensor data
+            if (parsed.hb !== undefined) {
+                console.debug('BLE heartbeat received');
+                return;
+            }
+            // Diagnostic log messages from GETLOG command
+            if (parsed.log !== undefined) {
+                if (parsed.log === 'start') {
+                    diagLogBuffer = [];
+                    diagLogExpectedCount = parsed.n || 0;
+                    diagLogCollecting = true;
+                    console.log(`[DiagLog] Receiving ${diagLogExpectedCount} events...`);
+                } else if (parsed.log === 'evt' && diagLogCollecting) {
+                    diagLogBuffer.push({
+                        index: parsed.i,
+                        timestamp: parsed.t,
+                        event: parsed.e,
+                        value: parsed.v,
+                    });
+                } else if (parsed.log === 'end') {
+                    diagLogCollecting = false;
+                    console.log(`[DiagLog] Received ${diagLogBuffer.length} events`);
+                    console.table(diagLogBuffer);
+                    diagLogCallbacks.forEach(cb => cb([...diagLogBuffer]));
+                }
+                return;
+            }
+            // Compact format: {"t":millis,"s":[val0,val1,val2,val3]}
+            if (parsed.s && Array.isArray(parsed.s)) {
+                latestSensorData = parsed.s.map((amplitude: number, index: number) => {
+                    const normalized = Math.min(100, (amplitude / 4095) * 100);
+                    latestRawNormalized[index] = normalized;
+                    const calibrated = Math.max(0, normalized - (calibrationBaselines[index] || 0));
+                    return {
+                        id: index,
+                        data: [{ time: new Date(), amplitude: calibrated }]
+                    };
+                });
+            } else if (Array.isArray(parsed)) {
+                // Legacy format: [{"id":0,"data":[{"time":"...","amplitude":1234}]},...]
+                latestSensorData = parsed.map((item: any) => ({
+                    id: item.id,
+                    data: item.data.map((d: any) => {
+                        const normalized = Math.min(100, (Number(d.amplitude) / 4095) * 100);
+                        latestRawNormalized[item.id] = normalized;
+                        const calibrated = Math.max(0, normalized - (calibrationBaselines[item.id] || 0));
+                        return { time: new Date(), amplitude: calibrated };
+                    })
+                }));
+            }
         } catch (e) {
             console.error("Error parsing sensor data", e);
         }
@@ -143,17 +217,24 @@ export const EspApi = {
 
   // First Page
   switchOn: async (isOn: boolean): Promise<void> => {
-    // Send raw byte 1 or 0 for LED command to match firmware expectation
-    const payload = new Uint8Array([isOn ? 1 : 0]);
-    return bleService.write(payload);
+    // Use string command to avoid null byte (0x00) issue with Arduino String
+    const command = `POWER:${isOn ? '1' : '0'}`;
+    const encoder = new TextEncoder();
+    return bleService.write(encoder.encode(command));
   },
   ping: (): void => {
     // TODO: Implement communication with ESP32
     console.log('ping');
   },
   setVolumeTotal: (volume: number): void => {
-    // TODO: Implement communication with ESP32
-    console.log('setVolumeTotal', volume);
+    EspApi.write(BleEndpoints.VOLUME_TOTAL, `${volume}`);
+  },
+  setMode: (mode: AudioMode): void => {
+    EspApi.write(BleEndpoints.MODE, `${mode}`);
+  },
+  // Sensitivity slider: 0=back sensitive, 50=balanced, 100=front sensitive
+  setSensitivity: (value: number): void => {
+    EspApi.write(BleEndpoints.SENSITIVITY, `${value}`);
   },
   getVolume: (): number => {
     // TODO: Implement communication with ESP32
@@ -184,8 +265,11 @@ export const EspApi = {
     return [];
   },
   setSensorsThreshold: (thresholds: number[]): void => {
-    // TODO: Implement communication with ESP32
-    console.log('setSensorsThreshold', thresholds);
+    // Convert from 0-100 range to raw ADC units (0-4095)
+    const rawThresholds = thresholds.map(v => Math.round((v / 100) * 4095));
+    const command = `SENSOR_THRESHOLD:${rawThresholds.join(',')}`;
+    const encoder = new TextEncoder();
+    bleService.write(encoder.encode(command));
   },
   getSensorVolume: (id: number): number => {
     // TODO: Implement communication with ESP32
@@ -195,6 +279,50 @@ export const EspApi = {
   setSensorVolume: (id: number, volume: number): void => {
     const data = `${id},${volume}`;
     EspApi.write(BleEndpoints.SENSOR_VOLUME, data);
+  },
+
+  // ---------- Diagnostic Log ----------
+  // Request the ESP32 to send its event log (ring buffer of last 64 events).
+  // Events include: BLE disconnects, heap warnings, SD read slowdowns, loop stalls.
+  // Returns a Promise that resolves with the log entries.
+  requestDiagLog: (): Promise<DiagnosticEvent[]> => {
+    return new Promise((resolve) => {
+      // Register one-time callback
+      const handler: DiagLogCallback = (events) => {
+        diagLogCallbacks = diagLogCallbacks.filter(cb => cb !== handler);
+        resolve(events);
+      };
+      diagLogCallbacks.push(handler);
+
+      // Timeout: if no response in 10s, resolve with whatever we have
+      setTimeout(() => {
+        diagLogCallbacks = diagLogCallbacks.filter(cb => cb !== handler);
+        resolve([...diagLogBuffer]);
+      }, 10000);
+
+      // Send GETLOG command
+      EspApi.write(BleEndpoints.GETLOG, '1');
+    });
+  },
+
+  // Subscribe to diagnostic log updates (called each time a log is received)
+  onDiagLog: (callback: DiagLogCallback): void => {
+    diagLogCallbacks.push(callback);
+  },
+
+  // Get last received diagnostic log without requesting new one
+  getLastDiagLog: (): DiagnosticEvent[] => {
+    return [...diagLogBuffer];
+  },
+
+  calibrateSensors: async () => {
+    // Use the raw normalized values (before calibration subtraction)
+    calibrationBaselines = [...latestRawNormalized];
+    // Convert from normalized (0-100) back to raw ADC (0-4095)
+    const rawBaselines = calibrationBaselines.map(v => Math.round((v / 100) * 4095));
+    const command = `CALIBRATE:${rawBaselines.join(',')}`;
+    const encoder = new TextEncoder();
+    await bleService.write(encoder.encode(command));
   },
 };
 

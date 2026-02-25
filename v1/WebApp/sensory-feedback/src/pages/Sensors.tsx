@@ -115,8 +115,17 @@ export function Sensors() {
           <div className="relative overflow-hidden h-[25vh] min-h-[160px] flex items-center justify-center -mb-6">
              <WalkingModel sensors={currentSensors} camera={[1.4, 1.0, 2.0]} />
           </div>
-          <div className="relative z-10 w-full text-center pb-3">
+          <div className="relative z-10 w-full text-center pb-3 flex flex-col items-center gap-2">
             <span className="text-[9px] uppercase tracking-[0.2em] text-slate-400 font-semibold bg-white/50 px-2 py-0.5 rounded-full backdrop-blur-sm border border-white/40">Real-time Feedback</span>
+            <button
+                onClick={() => {
+                    EspApi.calibrateSensors();
+                    console.log("Calibrated with raw values");
+                }}
+                className="px-4 py-1.5 text-xs font-bold text-white bg-slate-800 rounded-full shadow-md active:scale-95 transition-all hover:bg-slate-700"
+            >
+                Calibrate Sensors
+            </button>
          </div>
       </div>
 
